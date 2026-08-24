@@ -607,4 +607,39 @@ mod tests {
         let body = body_of(&document);
         assert_eq!(document.children(body).count(), 1);
     }
+
+    #[test]
+    fn frameset_document_replaces_body_and_ignores_stray_text() {
+        // html5lib-tests' tests2.dat#5: a bare `<frameset>` after the
+        // DOCTYPE, with trailing character data "in frameset" mode's
+        // "anything else" rule drops entirely (no `<body>` at all in
+        // the result — frameset and body are mutually exclusive).
+        let document = parse("<!DOCTYPE html><frameset>test");
+
+        let root = document.root();
+        let root_children: Vec<_> = document.children(root).collect();
+        assert_eq!(root_children.len(), 2);
+        assert_eq!(
+            document.node(root_children[0]).kind,
+            NodeKind::Doctype {
+                name: Some("html".to_owned()),
+                public_identifier: Some(String::new()),
+                system_identifier: Some(String::new()),
+            }
+        );
+        let html = root_children[1];
+
+        let html_children: Vec<_> = document.children(html).collect();
+        assert_eq!(html_children.len(), 2);
+        let NodeKind::Element { name, .. } = &document.node(html_children[0]).kind else {
+            unreachable!()
+        };
+        assert_eq!(name, "head");
+        let frameset = html_children[1];
+        let NodeKind::Element { name, .. } = &document.node(frameset).kind else {
+            unreachable!()
+        };
+        assert_eq!(name, "frameset");
+        assert_eq!(document.children(frameset).count(), 0);
+    }
 }

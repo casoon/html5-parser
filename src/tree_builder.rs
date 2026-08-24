@@ -1435,7 +1435,10 @@ pub(crate) enum InsertionMode {
     InRow,
     InCell,
     AfterBody,
+    InFrameset,
+    AfterFrameset,
     AfterAfterBody,
+    AfterAfterFrameset,
 }
 
 /// Which variant of §13.2.6.2's "generic raw text/RCDATA element parsing
@@ -2436,7 +2439,12 @@ impl TreeBuilder {
             InsertionMode::InRow => self.process_token_in_row(kind, position),
             InsertionMode::InCell => self.process_token_in_cell(kind, position),
             InsertionMode::AfterBody => self.process_token_after_body(kind, position),
+            InsertionMode::InFrameset => self.process_token_in_frameset(kind, position),
+            InsertionMode::AfterFrameset => self.process_token_after_frameset(kind, position),
             InsertionMode::AfterAfterBody => self.process_token_after_after_body(kind, position),
+            InsertionMode::AfterAfterFrameset => {
+                self.process_token_after_after_frameset(kind, position)
+            }
         }
     }
 
@@ -3126,6 +3134,18 @@ impl TreeBuilder {
                 self.insertion_mode = InsertionMode::InBody;
                 return;
             }
+            // Only reachable in the fragment case per spec (this crate
+            // never does fragment parsing) — a non-fragment document
+            // can't nest anything requiring a stack walk (a `<table>`,
+            // `<template>`, etc.) *inside* `<frameset>` content in the
+            // first place, "in frameset"'s own rules reject it. Kept
+            // for spec fidelity regardless, same stance as other
+            // practically-unreachable-but-transcribed branches (e.g.
+            // the adoption agency algorithm's step 4.19 guards).
+            if self.node_has_html_name(current, "frameset") {
+                self.insertion_mode = InsertionMode::InFrameset;
+                return;
+            }
             if self.node_has_html_name(current, "html") {
                 self.insertion_mode = if self.head_element_pointer.is_none() {
                     InsertionMode::BeforeHead
@@ -3352,7 +3372,13 @@ impl TreeBuilder {
             }
             TokenKind::StartTag(tag) if tag.name == "body" => {
                 self.insert_html_element(tag, Some(position));
+                self.frameset_ok = false;
                 self.insertion_mode = InsertionMode::InBody;
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::StartTag(tag) if tag.name == "frameset" => {
+                self.insert_html_element(tag, Some(position));
+                self.insertion_mode = InsertionMode::InFrameset;
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag)
@@ -3507,21 +3533,39 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "frameset" => {
-                // Frameset documents are entirely out of scope (see
-                // plan/03-tree-construction.md) — html-conform's schema
-                // can never validate one. Rather than half-implement
-                // "in frameset" mode, this never creates a frameset
-                // element, same as this rule's own several real
-                // ignore-conditions would in a full implementation.
-                let _ = tag;
+                // Parse-error-only observation has no tree-shape effect.
+                // Note the ignore condition here is genuinely only two
+                // clauses (unlike the `<body>` start-tag rule just
+                // above, which has a third, explicit "or if there is a
+                // template element on the stack" clause) — verified
+                // against the raw spec markup, not assumed from the
+                // rules' surface similarity.
+                let second = self.open_elements.entries.get(1).copied();
+                let ignore = self.open_elements.entries.len() == 1
+                    || second.is_none_or(|node| !self.node_has_html_name(node, "body"));
+                if ignore || !self.frameset_ok {
+                    return TokenOutcome::Consumed(None);
+                }
+                self.document
+                    .remove(second.expect("checked by `ignore` above"));
+                let html = self
+                    .open_elements
+                    .topmost()
+                    .expect("the html element is always on the stack by the time \"in body\" runs");
+                while self.open_elements.current_node() != Some(html) {
+                    self.open_elements.pop();
+                }
+                self.insert_html_element(tag, Some(position));
+                self.insertion_mode = InsertionMode::InFrameset;
                 TokenOutcome::Consumed(None)
             }
             TokenKind::Eof => {
                 // The "stack of template insertion modes" branch never
                 // applies (no such stack — <template> is a plain
-                // element, see the scope decision). The parse-error
-                // check has no tree-shape effect. "Stop parsing" itself
-                // is a driver-loop concern, not yet built.
+                // element, see plan/03-tree-construction.md's scope
+                // decision, still in force). The parse-error check has
+                // no tree-shape effect. "Stop parsing" itself is a
+                // driver-loop concern, not yet built.
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "body" => {
@@ -4855,10 +4899,112 @@ impl TreeBuilder {
         }
     }
 
-    /// The "after after body" insertion mode (§13.2.6.4.20) — the very
-    /// last insertion mode this crate implements (see the scope
-    /// decision excluding the frameset-related modes,
-    /// plan/03-tree-construction.md).
+    /// The "in frameset" insertion mode (§13.2.6.4.18).
+    fn process_token_in_frameset(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
+        match kind {
+            TokenKind::Character(c) if is_whitespace(*c) => {
+                self.insert_character(*c, Some(position));
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::Comment(data) => {
+                self.insert_comment(data.clone(), Some(position));
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::ProcessingInstruction(pi) => {
+                self.insert_processing_instruction(
+                    pi.target.clone(),
+                    pi.data.clone(),
+                    Some(position),
+                );
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::StartTag(tag) if tag.name == "html" => {
+                self.process_token_in_body(kind, position)
+            }
+            TokenKind::StartTag(tag) if tag.name == "frameset" => {
+                self.insert_html_element(tag, Some(position));
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::EndTag(tag) if tag.name == "frameset" => {
+                // "If the current node is the root html element" is
+                // only reachable in the fragment case (this crate never
+                // does fragment parsing, same simplification as "after
+                // body"'s `</html>` handling above).
+                let _ = tag;
+                self.open_elements.pop();
+                let current_is_frameset = self
+                    .open_elements
+                    .current_node()
+                    .is_some_and(|node| self.node_has_html_name(node, "frameset"));
+                if !current_is_frameset {
+                    self.insertion_mode = InsertionMode::AfterFrameset;
+                }
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::StartTag(tag) if tag.name == "frame" => {
+                self.insert_html_element(tag, Some(position));
+                self.open_elements.pop();
+                // "Acknowledge the token's self-closing flag" has no
+                // tree-shape effect (no diagnostics tracked).
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::StartTag(tag) if tag.name == "noframes" => {
+                self.process_token_in_head(kind, position)
+            }
+            TokenKind::Eof => {
+                // The parse-error check ("current node is not the root
+                // html element") has no tree-shape effect; it can only
+                // be false in the fragment case anyway (never reached).
+                // "Stop parsing" itself is a driver-loop concern, not
+                // yet built.
+                TokenOutcome::Consumed(None)
+            }
+            _ => TokenOutcome::Consumed(None),
+        }
+    }
+
+    /// The "after frameset" insertion mode (§13.2.6.4.19).
+    fn process_token_after_frameset(
+        &mut self,
+        kind: &TokenKind,
+        position: Position,
+    ) -> TokenOutcome {
+        match kind {
+            TokenKind::Character(c) if is_whitespace(*c) => {
+                self.insert_character(*c, Some(position));
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::Comment(data) => {
+                self.insert_comment(data.clone(), Some(position));
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::ProcessingInstruction(pi) => {
+                self.insert_processing_instruction(
+                    pi.target.clone(),
+                    pi.data.clone(),
+                    Some(position),
+                );
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::StartTag(tag) if tag.name == "html" => {
+                self.process_token_in_body(kind, position)
+            }
+            TokenKind::EndTag(tag) if tag.name == "html" => {
+                let _ = tag;
+                self.insertion_mode = InsertionMode::AfterAfterFrameset;
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::StartTag(tag) if tag.name == "noframes" => {
+                self.process_token_in_head(kind, position)
+            }
+            TokenKind::Eof => TokenOutcome::Consumed(None),
+            _ => TokenOutcome::Consumed(None),
+        }
+    }
+
+    /// The "after after body" insertion mode (§13.2.6.4.20).
     fn process_token_after_after_body(
         &mut self,
         kind: &TokenKind,
@@ -4889,6 +5035,41 @@ impl TreeBuilder {
                 self.insertion_mode = InsertionMode::InBody;
                 TokenOutcome::Reprocess
             }
+        }
+    }
+
+    /// The "after after frameset" insertion mode (§13.2.6.4.21) — the
+    /// very last insertion mode this crate implements.
+    fn process_token_after_after_frameset(
+        &mut self,
+        kind: &TokenKind,
+        position: Position,
+    ) -> TokenOutcome {
+        match kind {
+            TokenKind::Comment(data) => {
+                self.append_comment_to_document(data.clone(), position);
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::ProcessingInstruction(pi) => {
+                self.append_processing_instruction_to_document(
+                    pi.target.clone(),
+                    pi.data.clone(),
+                    position,
+                );
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::Doctype(_) => self.process_token_in_body(kind, position),
+            TokenKind::Character(c) if is_whitespace(*c) => {
+                self.process_token_in_body(kind, position)
+            }
+            TokenKind::StartTag(tag) if tag.name == "html" => {
+                self.process_token_in_body(kind, position)
+            }
+            TokenKind::Eof => TokenOutcome::Consumed(None),
+            TokenKind::StartTag(tag) if tag.name == "noframes" => {
+                self.process_token_in_head(kind, position)
+            }
+            _ => TokenOutcome::Consumed(None),
         }
     }
 }
@@ -6302,7 +6483,11 @@ mod insertion_mode_tests {
     fn in_body_character_sets_frameset_ok_and_ignores_nul() {
         let mut builder = TreeBuilder::new();
         let (_, body) = bootstrap_in_body(&mut builder);
-        assert!(builder.frameset_ok);
+        // `bootstrap_in_body` goes through "after head"'s real `<body>`
+        // start-tag rule, which itself sets frameset-ok to "not ok" —
+        // reset it here to isolate this test's actual subject, "in
+        // body"'s own character-token rule.
+        builder.frameset_ok = true;
 
         builder.process_token(&TokenKind::Character('\0'), pos());
         assert_eq!(builder.document.children(body).count(), 0);
@@ -7064,6 +7249,223 @@ mod insertion_mode_tests {
                 attributes: vec![],
             }
         );
+    }
+
+    #[test]
+    fn in_body_frameset_replaces_body_when_frameset_ok() {
+        let mut builder = TreeBuilder::new();
+        let (html, body) = bootstrap_in_body(&mut builder);
+        // "after head"'s own `<body>` rule already set frameset-ok to
+        // "not ok" (§13.2.6.4.6) — reset it to exercise the case this
+        // test is actually about, matching
+        // `in_body_character_sets_frameset_ok_and_ignores_nul`'s same
+        // reasoning above.
+        builder.frameset_ok = true;
+        let p = builder.insert_html_element(
+            &TagToken {
+                name: "p".to_owned(),
+                self_closing: false,
+                attributes: vec![],
+            },
+            None,
+        );
+
+        builder.process_token(&start_tag("frameset"), pos());
+
+        // `body` (with its `p` child) is detached entirely; `html`'s
+        // children are now [head, frameset] — `head` is untouched, only
+        // the *second* element (`body`) is ever removed.
+        let html_children: Vec<_> = builder.document.children(html).collect();
+        assert_eq!(html_children.len(), 2);
+        let frameset = html_children[1];
+        assert_eq!(
+            builder.document.node(frameset).kind,
+            NodeKind::Element {
+                name: "frameset".to_owned(),
+                namespace: Some(super::HTML_NAMESPACE.to_owned()),
+                attributes: vec![],
+            }
+        );
+        assert_eq!(builder.document.parent(body), None);
+        assert_eq!(builder.document.parent(p), Some(body));
+        assert_eq!(builder.open_elements.current_node(), Some(frameset));
+        assert_eq!(builder.insertion_mode, InsertionMode::InFrameset);
+    }
+
+    #[test]
+    fn in_body_frameset_ignored_when_frameset_ok_is_not_ok() {
+        let mut builder = TreeBuilder::new();
+        // Real, unmodified frameset-ok state: a `<body>` start tag
+        // (driven through "after head", inside `bootstrap_in_body`)
+        // already sets it to "not ok" per spec — the common real-world
+        // case (any body content before `<frameset>` disqualifies it).
+        let (_, body) = bootstrap_in_body(&mut builder);
+        assert!(!builder.frameset_ok);
+
+        builder.process_token(&start_tag("frameset"), pos());
+
+        assert_eq!(builder.open_elements.current_node(), Some(body));
+        assert_eq!(builder.insertion_mode, InsertionMode::InBody);
+    }
+
+    #[test]
+    fn after_head_frameset_inserts_and_switches_mode() {
+        let mut builder = TreeBuilder::new();
+        builder.process_token(&start_tag("head"), pos());
+        builder.process_token(&end_tag("head"), pos());
+        assert_eq!(builder.insertion_mode, InsertionMode::AfterHead);
+
+        builder.process_token(&start_tag("frameset"), pos());
+
+        let frameset = builder.open_elements.current_node().unwrap();
+        assert_eq!(
+            builder.document.node(frameset).kind,
+            NodeKind::Element {
+                name: "frameset".to_owned(),
+                namespace: Some(super::HTML_NAMESPACE.to_owned()),
+                attributes: vec![],
+            }
+        );
+        assert_eq!(builder.insertion_mode, InsertionMode::InFrameset);
+    }
+
+    /// Drives a fresh builder into "in frameset" via a `<head></head>`
+    /// then `<frameset>` — the "after head" path exercised just above.
+    /// Returns the frameset element.
+    fn bootstrap_in_frameset(builder: &mut TreeBuilder) -> NodeId {
+        builder.process_token(&start_tag("head"), pos());
+        builder.process_token(&end_tag("head"), pos());
+        builder.process_token(&start_tag("frameset"), pos());
+        builder.open_elements.current_node().unwrap()
+    }
+
+    #[test]
+    fn in_frameset_nested_frameset_start_tag_is_inserted() {
+        let mut builder = TreeBuilder::new();
+        let outer = bootstrap_in_frameset(&mut builder);
+
+        builder.process_token(&start_tag("frameset"), pos());
+
+        let inner = builder.open_elements.current_node().unwrap();
+        assert_ne!(inner, outer);
+        assert_eq!(builder.document.parent(inner), Some(outer));
+        assert_eq!(builder.insertion_mode, InsertionMode::InFrameset);
+    }
+
+    #[test]
+    fn in_frameset_frame_start_tag_is_inserted_and_immediately_popped() {
+        let mut builder = TreeBuilder::new();
+        let frameset = bootstrap_in_frameset(&mut builder);
+
+        builder.process_token(&start_tag("frame"), pos());
+
+        // Popped immediately: `frameset` (not `frame`) is current again.
+        assert_eq!(builder.open_elements.current_node(), Some(frameset));
+        let children: Vec<_> = builder.document.children(frameset).collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            builder.document.node(children[0]).kind,
+            NodeKind::Element {
+                name: "frame".to_owned(),
+                namespace: Some(super::HTML_NAMESPACE.to_owned()),
+                attributes: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn in_frameset_end_tag_pops_and_switches_to_after_frameset() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_frameset(&mut builder);
+
+        builder.process_token(&end_tag("frameset"), pos());
+
+        // Current node (`html`) is no longer a `frameset` element, so
+        // the mode switches — the outermost `</frameset>` case.
+        assert_eq!(builder.insertion_mode, InsertionMode::AfterFrameset);
+    }
+
+    #[test]
+    fn in_frameset_nested_end_tag_stays_in_frameset_mode() {
+        let mut builder = TreeBuilder::new();
+        let outer = bootstrap_in_frameset(&mut builder);
+        builder.process_token(&start_tag("frameset"), pos());
+
+        builder.process_token(&end_tag("frameset"), pos());
+
+        // Current node is `outer`, still a `frameset` element — mode
+        // stays put per §13.2.6.4.18's own condition on this.
+        assert_eq!(builder.open_elements.current_node(), Some(outer));
+        assert_eq!(builder.insertion_mode, InsertionMode::InFrameset);
+    }
+
+    #[test]
+    fn in_frameset_whitespace_is_inserted_non_whitespace_is_ignored() {
+        let mut builder = TreeBuilder::new();
+        let frameset = bootstrap_in_frameset(&mut builder);
+
+        builder.process_token(&TokenKind::Character(' '), pos());
+        builder.process_token(&TokenKind::Character('x'), pos());
+
+        let children: Vec<_> = builder.document.children(frameset).collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            builder.document.node(children[0]).kind,
+            NodeKind::Text {
+                content: " ".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn after_frameset_end_tag_html_switches_to_after_after_frameset() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_frameset(&mut builder);
+        builder.process_token(&end_tag("frameset"), pos());
+        assert_eq!(builder.insertion_mode, InsertionMode::AfterFrameset);
+
+        builder.process_token(&end_tag("html"), pos());
+
+        assert_eq!(builder.insertion_mode, InsertionMode::AfterAfterFrameset);
+    }
+
+    #[test]
+    fn after_after_frameset_comment_is_appended_to_the_document() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_frameset(&mut builder);
+        builder.process_token(&end_tag("frameset"), pos());
+        builder.process_token(&end_tag("html"), pos());
+        assert_eq!(builder.insertion_mode, InsertionMode::AfterAfterFrameset);
+        let root = builder.document.root();
+
+        builder.process_token(&TokenKind::Comment("hi".to_owned()), pos());
+
+        let children: Vec<_> = builder.document.children(root).collect();
+        assert_eq!(
+            builder.document.node(*children.last().unwrap()).kind,
+            NodeKind::Comment {
+                content: "hi".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn after_after_frameset_anything_else_is_ignored_not_reprocessed() {
+        // Unlike "after after body"'s catch-all (switches to "in body"
+        // and reprocesses), "after after frameset"'s is just "parse
+        // error, ignore the token" — no mode switch, no reprocessing.
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_frameset(&mut builder);
+        builder.process_token(&end_tag("frameset"), pos());
+        builder.process_token(&end_tag("html"), pos());
+        let current_before = builder.open_elements.current_node();
+        let stack_len_before = builder.open_elements.entries.len();
+
+        builder.process_token(&start_tag("p"), pos());
+
+        assert_eq!(builder.insertion_mode, InsertionMode::AfterAfterFrameset);
+        assert_eq!(builder.open_elements.current_node(), current_before);
+        assert_eq!(builder.open_elements.entries.len(), stack_len_before);
     }
 
     /// Drives a fresh builder into foreign content via `bootstrap_in_body`
