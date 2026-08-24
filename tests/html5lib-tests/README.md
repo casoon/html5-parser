@@ -4,7 +4,10 @@ The `.dat` files in this directory are the WHATWG/html5lib
 tree-construction conformance corpus, fetched by
 `xtask/fetch-html5lib-tests.py` from
 <https://github.com/web-platform-tests/wpt/tree/master/html/syntax/parsing/resources>
-(2026-08-24). See `LICENSE` for redistribution terms.
+(2026-08-24). Two licenses apply — the original html5lib-tests copyright
+(MIT) and web-platform-tests' own project license (3-Clause BSD), which
+now governs the copy fetched from there — see `LICENSE` for both, in
+full.
 
 ## Why wpt, not html5lib-tests
 

@@ -1,13 +1,48 @@
-The .dat files in this directory are vendored from the web-platform-tests
-project (https://github.com/web-platform-tests/wpt,
-html/syntax/parsing/resources/), which maintains the tree-construction
-conformance tests originally published by html5lib-tests
-(https://github.com/html5lib/html5lib-tests). See README.md in this
-directory for fetch provenance.
+The .dat files in this directory are the html5lib-tests tree-construction
+conformance corpus (https://github.com/html5lib/html5lib-tests), fetched
+from where that project's own README now says they're actually
+maintained — web-platform-tests
+(https://github.com/web-platform-tests/wpt,
+html/syntax/parsing/resources/). See README.md in this directory for
+fetch provenance. Two licenses apply, both permissive and both
+reproduced in full below:
 
-Redistributed here under the 3-Clause BSD License:
+1. The original html5lib-tests copyright/license (MIT) — this is the
+   test data's true origin and authorship; MIT requires the notice below
+   to be retained in redistributions.
+2. web-platform-tests' own project license (3-Clause BSD) — the license
+   actually governing the copy this crate fetched from, since wpt now
+   hosts and maintains this content.
 
-The 3-Clause BSD License
+---
+
+1. html5lib-tests (original authorship), MIT License:
+
+Copyright (c) 2006-2013 James Graham, Geoffrey Sneddon, and
+other contributors
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+2. web-platform-tests (current hosting/maintenance), 3-Clause BSD License:
 
 Copyright © web-platform-tests contributors
 
