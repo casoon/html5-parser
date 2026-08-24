@@ -36,8 +36,15 @@ not a source to copy code from.
 
 The tokenizer (§13.2.5) and tree-construction algorithm (§13.2.6 — all
 insertion modes, adoption agency, foster parenting, foreign content) are
-implemented and wired end to end. No public API yet (see Scope above —
-everything is crate-internal until Step 2); not published to crates.io.
+implemented and wired end to end.
+
+`pub fn parse(input: &str) -> Document` and the read-only tree types
+(`Document`, `NodeId`, `NodeKind`, `Node`, `Attribute`, `Position`,
+`Children`) are public — just enough to walk the resulting tree and read
+each node's kind and source position, matching what `html-conform`'s
+`src/infoset.rs::normalize()` needs. `Tokenizer`/`TreeBuilder` and
+everything else stay crate-internal (see Scope above — no commitment to
+a generic public API yet, that's Step 2); not published to crates.io.
 
 ### Known limitations
 

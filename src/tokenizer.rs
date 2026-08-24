@@ -10,17 +10,17 @@ use std::collections::VecDeque;
 
 use crate::entities;
 
-/// A source position, matching `html-conform::finding::SourceLocation`'s
-/// field layout exactly so the eventual integration (Phase 05) needs no
-/// conversion.
+/// A source position: where a node parsed from the input started.
+/// Matches `html-conform::finding::SourceLocation`'s field layout exactly
+/// so the eventual integration (Phase 05) needs no conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Position {
+pub struct Position {
     /// One-based line number.
-    pub(crate) line: u32,
+    pub line: u32,
     /// One-based column number.
-    pub(crate) column: u32,
+    pub column: u32,
     /// Zero-based byte offset.
-    pub(crate) byte_offset: usize,
+    pub byte_offset: usize,
 }
 
 /// A single `name=value` attribute on a start or end tag token.

@@ -1,33 +1,36 @@
-// TODO: public API surface (parse HTML5 input -> tree, with per-node source
-// positions). Scope for now: only what html-conform's src/infoset.rs needs
-// to replace its current HTML5-parsing dependency's role (Schicht 1). See
-// plan/DECISIONS.md.
+// Public API surface: `parse` plus the read-only tree types
+// (`Document`/`NodeId`/`NodeKind`/`Attribute`/`Position`/`Node`/`Children`)
+// needed to walk its output — just enough for html-conform's
+// `src/infoset.rs::normalize()` to consume, per Step 1 of this crate's
+// two-stage scope (see `CLAUDE.md`). `Tokenizer`/`TreeBuilder` and
+// everything else stay crate-internal; there's no commitment to their
+// shape yet. See plan/DECISIONS.md.
 
 mod document;
 mod entities;
 mod tokenizer;
 mod tree_builder;
 
-use document::Document;
+pub use document::{Attribute, Children, Document, Node, NodeId, NodeKind};
+pub use tokenizer::Position;
+
 use tokenizer::Tokenizer;
 use tree_builder::TreeBuilder;
 
 /// The driver loop (§13.2 "Parsing HTML documents", the "tokenization and
-/// tree construction" step): feeds `input` through the tokenizer, handing
-/// each token to the tree builder, and applies the two pieces of feedback
+/// tree construction" step): parses `input` into a [`Document`] tree with
+/// per-node source positions, feeding it through the tokenizer and handing
+/// each token to the tree builder, applying the two pieces of feedback
 /// tree construction sends back to the tokenizer — a state switch
 /// (`Tokenizer::switch_to`, for RCDATA/RAWTEXT/script-data/PLAINTEXT
 /// elements) and the foreign-content flag (`Tokenizer::set_in_foreign_content`,
-/// consulted only by CDATA-section handling). Not `pub`: this crate has no
-/// public API yet in Step 1 of its two-stage scope (see `CLAUDE.md`) — only
-/// what's needed to exercise the parser end to end from within the crate.
+/// consulted only by CDATA-section handling).
 ///
 /// The tokenizer's iterator yields exactly one `Eof` token and then ends
 /// (`None`) on the next call, so the loop needs no separate stop condition
 /// — "stop parsing" (§13.2.6.4.7's EOF handling and similar) is simply
 /// "there are no more tokens".
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn parse(input: &str) -> Document {
+pub fn parse(input: &str) -> Document {
     let mut tokenizer = Tokenizer::new(input);
     let mut tree_builder = TreeBuilder::new();
     while let Some(token) = tokenizer.next() {

@@ -15,9 +15,9 @@ use crate::tokenizer::{Attribute as TokenAttribute, Position};
 
 /// Identifies a node within a [`Document`]'s arena. `NonZeroU32` so that
 /// `Option<NodeId>` is the same size as `NodeId` — index 0 is never
-/// issued (see [`Document::new`]).
+/// issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct NodeId(NonZeroU32);
+pub struct NodeId(NonZeroU32);
 
 impl NodeId {
     fn from_index(index: usize) -> Self {
@@ -36,10 +36,10 @@ impl NodeId {
 /// namespace during tree construction — see plan/03-tree-construction.md's
 /// Foreign-Content-Dispatch step.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Attribute {
-    pub(crate) name: String,
-    pub(crate) value: String,
-    pub(crate) namespace: Option<String>,
+pub struct Attribute {
+    pub name: String,
+    pub value: String,
+    pub namespace: Option<String>,
 }
 
 impl From<TokenAttribute> for Attribute {
@@ -65,7 +65,7 @@ impl From<TokenAttribute> for Attribute {
 /// content both resolve straight to character tokens, see
 /// `tokenizer::TokenKind`'s doc comment).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NodeKind {
+pub enum NodeKind {
     /// The document node — there is exactly one per [`Document`].
     Document,
     /// An element node, e.g. `<div class="x">`.
@@ -101,15 +101,11 @@ pub(crate) enum NodeKind {
 /// implied `<html>`/`<head>`/`<body>` — `Some` for everything else), and
 /// its tree-navigation links.
 #[derive(Debug, Clone)]
-pub(crate) struct Node {
-    pub(crate) kind: NodeKind,
-    // Read only by tests so far — this crate has no real consumer of
-    // per-node positions yet (no `pub` API, see CLAUDE.md's Step 1
-    // scope), even though tracking them accurately is this crate's
-    // whole reason for existing. Not dead in the sense of "unneeded",
-    // just "not read outside tests yet".
-    #[allow(dead_code)]
-    pub(crate) position: Option<Position>,
+pub struct Node {
+    pub kind: NodeKind,
+    /// The node's position in the original input, or `None` for
+    /// synthesized nodes (see the struct-level doc comment above).
+    pub position: Option<Position>,
     parent: Option<NodeId>,
     first_child: Option<NodeId>,
     last_child: Option<NodeId>,
@@ -131,17 +127,18 @@ impl Node {
     }
 }
 
-/// An HTML document tree, built by `tree_builder` (this phase) from the
-/// tokenizer's (Phase 02) token stream.
+/// An HTML document tree, produced by [`crate::parse`].
 ///
-/// This is the data model only: navigation and the bare minimum mutation
-/// (`new_node`/`append_child`) needed to construct and inspect a tree.
-/// The spec-level insertion algorithms ("insert a comment", "insert an
-/// HTML element", table foster parenting, ...) are tree_builder's job,
-/// built on top of these primitives — see plan/03-tree-construction.md's
-/// "gemeinsame Tree-Construction-Infrastruktur" step.
+/// Read access (`root`/`node`/`parent`/`children`) is the public surface:
+/// enough to walk the tree and read each node's kind and source position.
+/// Mutation (`new_node`/`append_child`/...) stays crate-internal — it's
+/// `tree_builder`'s job to build the tree in the first place, following
+/// the spec-level insertion algorithms ("insert a comment", "insert an
+/// HTML element", table foster parenting, ...), see
+/// plan/03-tree-construction.md's "gemeinsame
+/// Tree-Construction-Infrastruktur" step.
 #[derive(Debug)]
-pub(crate) struct Document {
+pub struct Document {
     nodes: Vec<Node>,
     root: NodeId,
 }
@@ -159,11 +156,14 @@ impl Document {
         }
     }
 
-    pub(crate) fn root(&self) -> NodeId {
+    /// Returns the id of the document's own root node (the [`NodeKind::Document`] node).
+    pub fn root(&self) -> NodeId {
         self.root
     }
 
-    pub(crate) fn node(&self, id: NodeId) -> &Node {
+    /// Returns the node identified by `id`: its kind, source position, and
+    /// tree-navigation links (via [`Document::parent`]/[`Document::children`]).
+    pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id.index()]
     }
 
@@ -174,7 +174,9 @@ impl Document {
         &mut self.nodes[id.index()]
     }
 
-    pub(crate) fn parent(&self, id: NodeId) -> Option<NodeId> {
+    /// Returns `id`'s parent node, or `None` if `id` is the document's
+    /// own root node.
+    pub fn parent(&self, id: NodeId) -> Option<NodeId> {
         self.node(id).parent
     }
 
@@ -309,7 +311,7 @@ impl Document {
 
     /// Returns an iterator over the direct children of `id`, in document
     /// order.
-    pub(crate) fn children(&self, id: NodeId) -> Children<'_> {
+    pub fn children(&self, id: NodeId) -> Children<'_> {
         Children {
             document: self,
             next: self.node(id).first_child,
@@ -325,7 +327,7 @@ impl Default for Document {
 
 /// Iterator over a node's direct children, in document order. Created by
 /// [`Document::children`].
-pub(crate) struct Children<'a> {
+pub struct Children<'a> {
     document: &'a Document,
     next: Option<NodeId>,
 }
