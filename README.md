@@ -48,7 +48,8 @@ a generic public API yet, that's Step 2); not published to crates.io.
 
 ### Known limitations
 
-Two deliberate, evidence-based scope decisions — not oversights:
+Three known gaps — the first two are deliberate, evidence-based scope
+decisions; the third is a documented gap, not yet a deliberate decision:
 
 - **Frameset-related insertion modes** ("in frameset", "after frameset",
   "after after frameset") are not implemented; `<frameset>`/`<frame>`/
@@ -59,11 +60,18 @@ Two deliberate, evidence-based scope decisions — not oversights:
   content-fragment semantics, no template insertion-modes stack, no
   shadow-root handling (§13.2.6.4.4's simplification). Rationale: no
   evidence `html-conform` needs real template-content semantics.
+- **`<selectedcontent>`** (the "customizable `<select>`" proposal's
+  live-mirrored-content element, a recent, still-evolving spec addition)
+  is parsed as an ordinary element — its content is not populated from
+  the initially-selected `<option>` at parse time. Found via the
+  html5lib-tests conformance corpus (`webkit02.dat`), not yet a
+  deliberate scope call — no evidence either way on whether
+  `html-conform` needs it, tracked as a gap until that's known.
 
 If `html-conform`'s needs change (e.g. it starts validating documents
-that can contain `<frameset>`, or gains real `<template>`-content test
-cases), these decisions should be revisited explicitly rather than
-half-implemented silently.
+that can contain `<frameset>`, or gains real `<template>`-content or
+`<selectedcontent>` test cases), these should be revisited explicitly
+rather than half-implemented silently.
 
 ## Testing
 
@@ -72,9 +80,9 @@ Besides hand-written unit/end-to-end tests (`src/tokenizer.rs`,
 `tests/html5lib_conformance.rs`: every applicable case (full-document,
 non-fragment, non-scripting — see `tests/html5lib-tests/README.md`) from
 the vendored [html5lib-tests](https://github.com/html5lib/html5lib-tests)
-tree-construction corpus — currently 1,726 applicable cases, 1,544
-passing (89%). Known failures (entirely the two "Known limitations"
-above — frameset and `<template>` content) are tracked explicitly in
+tree-construction corpus — currently 1,726 applicable cases, 1,547
+passing (90%). Known failures (all attributable to the three "Known
+limitations" above) are tracked explicitly in
 `tests/html5lib_known_failures.txt` rather than silently ignored; see
 that file's header for how to regenerate it.
 

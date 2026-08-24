@@ -4207,6 +4207,20 @@ impl TreeBuilder {
     fn process_token_text(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
         match kind {
             TokenKind::Character(c) => {
+                // "In body"'s `<textarea>` start-tag rule sets
+                // `skip_next_line_feed` (same flag `<pre>`/`<listing>`
+                // use) *before* switching to this very mode — so the
+                // character token it's meant to catch (a leading LF,
+                // ignored "as an authoring convenience") always arrives
+                // here, never back in "in body". Same check, same
+                // unconditional clear (checked once, for the immediate
+                // next token only) as "in body"'s own Character arm.
+                if self.skip_next_line_feed {
+                    self.skip_next_line_feed = false;
+                    if *c == '\n' {
+                        return TokenOutcome::Consumed(None);
+                    }
+                }
                 self.insert_character(*c, Some(position));
                 TokenOutcome::Consumed(None)
             }
@@ -6491,6 +6505,21 @@ mod insertion_mode_tests {
         assert_eq!(builder.insertion_mode, InsertionMode::Text);
         assert!(builder.skip_next_line_feed);
         assert!(!builder.frameset_ok);
+
+        // Unlike `<pre>`/`<listing>` (which stay in "in body"), the flag
+        // set above is only ever consulted once the driver has actually
+        // switched to "text" mode's own Character handling — regression
+        // test for a bug the html5lib-tests conformance corpus caught
+        // (tests3.dat's `<textarea>\nfoo</textarea>` cases), where
+        // "text" mode never checked it at all and the leading LF ended
+        // up in the tree.
+        let textarea = builder.open_elements.current_node().unwrap();
+        builder.process_token(&TokenKind::Character('\n'), pos());
+        assert_eq!(builder.document.children(textarea).count(), 0);
+        assert!(!builder.skip_next_line_feed);
+
+        builder.process_token(&TokenKind::Character('x'), pos());
+        assert_eq!(builder.document.children(textarea).count(), 1);
     }
 
     #[test]
