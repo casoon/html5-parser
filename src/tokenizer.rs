@@ -111,6 +111,111 @@ pub enum ParseErrorKind {
     ControlCharacterInInputStream,
 }
 
+impl std::fmt::Display for ParseErrorKind {
+    /// A short, human-readable description — not a transcription of any
+    /// particular consumer's exact wording (e.g. not vnu's), just a
+    /// plain-English description of the WHATWG condition this variant
+    /// names. Consumers that need their own phrasing should match on
+    /// [`ParseErrorKind`] directly instead of parsing this string.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::CdataInHtmlContent => "a CDATA section outside foreign content",
+            Self::IncorrectlyOpenedComment => "a comment that doesn't start with \"<!--\"",
+            Self::AbruptClosingOfEmptyComment => "an empty comment closed abruptly with \">\"",
+            Self::NestedComment => "a nested \"<!--\" inside a comment",
+            Self::IncorrectlyClosedComment => "a comment closed with \"--!>\" instead of \"-->\"",
+            Self::EofInComment => "end of file inside a comment",
+            Self::InvalidFirstCharacterOfTagName => "an invalid first character of a tag name",
+            Self::EofBeforeTagName => "end of file before a tag name",
+            Self::MissingEndTagName => "an end tag with no name (\"</>\")",
+            Self::EofInTag => "end of file inside a tag",
+            Self::EndTagWithAttributes => "an end tag with attributes",
+            Self::EndTagWithTrailingSolidus => "an end tag with a trailing \"/\"",
+            Self::DuplicateAttribute => "a duplicate attribute on a tag",
+            Self::UnexpectedNullCharacter => "an unexpected U+0000 NULL character",
+            Self::UnexpectedCharacterInAttributeName => {
+                "an unexpected character in an attribute name"
+            }
+            Self::MissingAttributeValue => "a missing attribute value after \"=\"",
+            Self::UnexpectedCharacterInUnquotedAttributeValue => {
+                "an unexpected character in an unquoted attribute value"
+            }
+            Self::MissingWhitespaceBetweenAttributes => "missing whitespace between attributes",
+            Self::UnexpectedSolidusInTag => "an unexpected \"/\" inside a tag",
+            Self::UnexpectedEqualsSignBeforeAttributeName => {
+                "an unexpected \"=\" before an attribute name"
+            }
+            Self::UnknownNamedCharacterReference => "an unknown named character reference",
+            Self::AbsenceOfDigitsInNumericCharacterReference => {
+                "a numeric character reference with no digits"
+            }
+            Self::MissingSemicolonAfterCharacterReference => {
+                "a character reference not terminated by \";\""
+            }
+            Self::NullCharacterReference => "a character reference resolving to U+0000 NULL",
+            Self::CharacterReferenceOutsideUnicodeRange => {
+                "a character reference outside the Unicode range"
+            }
+            Self::SurrogateCharacterReference => "a character reference resolving to a surrogate",
+            Self::NoncharacterCharacterReference => {
+                "a character reference resolving to a noncharacter"
+            }
+            Self::ControlCharacterReference => {
+                "a character reference resolving to a control character"
+            }
+            Self::MissingWhitespaceBeforeDoctypeName => {
+                "missing whitespace before the DOCTYPE name"
+            }
+            Self::MissingDoctypeName => "a DOCTYPE with no name",
+            Self::InvalidCharacterSequenceAfterDoctypeName => {
+                "an invalid character sequence after the DOCTYPE name"
+            }
+            Self::MissingWhitespaceAfterDoctypePublicKeyword => {
+                "missing whitespace after the DOCTYPE \"PUBLIC\" keyword"
+            }
+            Self::MissingWhitespaceAfterDoctypeSystemKeyword => {
+                "missing whitespace after the DOCTYPE \"SYSTEM\" keyword"
+            }
+            Self::MissingDoctypePublicIdentifier => "a missing DOCTYPE public identifier",
+            Self::MissingDoctypeSystemIdentifier => "a missing DOCTYPE system identifier",
+            Self::MissingQuoteBeforeDoctypePublicIdentifier => {
+                "a missing quote before the DOCTYPE public identifier"
+            }
+            Self::MissingQuoteBeforeDoctypeSystemIdentifier => {
+                "a missing quote before the DOCTYPE system identifier"
+            }
+            Self::AbruptDoctypePublicIdentifier => {
+                "a DOCTYPE public identifier closed abruptly with \">\""
+            }
+            Self::AbruptDoctypeSystemIdentifier => {
+                "a DOCTYPE system identifier closed abruptly with \">\""
+            }
+            Self::MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers => {
+                "missing whitespace between the DOCTYPE public and system identifiers"
+            }
+            Self::UnexpectedCharacterAfterDoctypeSystemIdentifier => {
+                "an unexpected character after the DOCTYPE system identifier"
+            }
+            Self::EofInDoctype => "end of file inside a DOCTYPE",
+            Self::EofInProcessingInstruction => "end of file inside a processing instruction",
+            Self::InvalidFirstCharacterOfProcessingInstructionTarget => {
+                "an invalid first character of a processing instruction target"
+            }
+            Self::InvalidProcessingInstructionTarget => "an invalid processing instruction target",
+            Self::DisallowedProcessingInstructionTarget => {
+                "a disallowed processing instruction target (\"xml\" or \"xml-stylesheet\")"
+            }
+            Self::EofInScriptHtmlCommentLikeText => {
+                "end of file inside a script element's HTML-comment-like text"
+            }
+            Self::EofInCdata => "end of file inside a CDATA section",
+            Self::NoncharacterInInputStream => "a Unicode noncharacter in the input stream",
+            Self::ControlCharacterInInputStream => "a control character in the input stream",
+        };
+        f.write_str(text)
+    }
+}
+
 /// A single `name=value` attribute on a start or end tag token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attribute {
@@ -4166,6 +4271,23 @@ mod tests {
             .map(|error| error.kind)
             .collect();
         assert!(kinds.contains(&ParseErrorKind::EofInCdata));
+    }
+
+    #[test]
+    fn every_parse_error_kind_has_a_non_empty_display() {
+        // Not exhaustive over every variant (that's what the `match` in
+        // the `Display` impl itself already guarantees at compile time —
+        // a missing arm is a compile error, not a silent gap) — just
+        // confirms the mechanism produces real, non-empty text for a
+        // sample of kinds actually reachable in this test module.
+        for kind in [
+            ParseErrorKind::DuplicateAttribute,
+            ParseErrorKind::EofInDoctype,
+            ParseErrorKind::NoncharacterInInputStream,
+            ParseErrorKind::ControlCharacterInInputStream,
+        ] {
+            assert!(!kind.to_string().is_empty());
+        }
     }
 
     #[test]
