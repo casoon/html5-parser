@@ -39,6 +39,25 @@ insertion modes, adoption agency, foster parenting, foreign content) are
 implemented and wired end to end. No public API yet (see Scope above —
 everything is crate-internal until Step 2); not published to crates.io.
 
+### Known limitations
+
+Two deliberate, evidence-based scope decisions — not oversights:
+
+- **Frameset-related insertion modes** ("in frameset", "after frameset",
+  "after after frameset") are not implemented; `<frameset>`/`<frame>`/
+  `<noframes>` content is not parsed per spec. Rationale: `html-conform`'s
+  RELAX NG schema can never validate a frameset document, so there is no
+  evidence this is needed for Step 1's scope.
+- **`<template>`** is treated as an ordinary element — no inert
+  content-fragment semantics, no template insertion-modes stack, no
+  shadow-root handling (§13.2.6.4.4's simplification). Rationale: no
+  evidence `html-conform` needs real template-content semantics.
+
+If `html-conform`'s needs change (e.g. it starts validating documents
+that can contain `<frameset>`, or gains real `<template>`-content test
+cases), these decisions should be revisited explicitly rather than
+half-implemented silently.
+
 ## License
 
 MIT — see `LICENSE`.
