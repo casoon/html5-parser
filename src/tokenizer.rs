@@ -58,6 +58,8 @@ pub enum ParseErrorKind {
     EofBeforeTagName,
     MissingEndTagName,
     EofInTag,
+    EndTagWithAttributes,
+    EndTagWithTrailingSolidus,
     DuplicateAttribute,
     UnexpectedNullCharacter,
     UnexpectedCharacterInAttributeName,
@@ -79,6 +81,14 @@ pub enum ParseErrorKind {
     MissingWhitespaceBeforeDoctypeName,
     MissingDoctypeName,
     InvalidCharacterSequenceAfterDoctypeName,
+    MissingWhitespaceAfterDoctypePublicKeyword,
+    MissingWhitespaceAfterDoctypeSystemKeyword,
+    MissingDoctypePublicIdentifier,
+    MissingDoctypeSystemIdentifier,
+    MissingQuoteBeforeDoctypePublicIdentifier,
+    MissingQuoteBeforeDoctypeSystemIdentifier,
+    AbruptDoctypePublicIdentifier,
+    AbruptDoctypeSystemIdentifier,
     MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers,
     UnexpectedCharacterAfterDoctypeSystemIdentifier,
     EofInDoctype,
@@ -90,6 +100,15 @@ pub enum ParseErrorKind {
     // Text content (§13.2.5.x script-data-like/CDATA states)
     EofInScriptHtmlCommentLikeText,
     EofInCdata,
+    // Input stream preprocessing (§13.2.3.5) — a one-time scan over the
+    // whole input, not a tokenizer-state transition. `surrogate-in-
+    // input-stream` has no variant here: it can never fire against a
+    // Rust `&str` input, since an unpaired surrogate is not a valid
+    // `char` in the first place (Rust's type system already rejects it
+    // at the `&str` boundary) — there is nothing this crate could ever
+    // detect, so no dead variant for it.
+    NoncharacterInInputStream,
+    ControlCharacterInInputStream,
 }
 
 /// A single `name=value` attribute on a start or end tag token.
@@ -386,6 +405,13 @@ impl Tokenizer {
         let mut positions = Vec::new();
         let mut line = 1u32;
         let mut column = 1u32;
+        // §13.2.3.5's input-stream-wide checks: a one-time scan, not a
+        // tokenizer-state transition, so collected separately here and
+        // merged into `errors` below rather than going through `self.error()`
+        // (no `self` exists yet at this point in construction). No
+        // `surrogate-in-input-stream` check: unreachable for a Rust `&str`
+        // input, see `ParseErrorKind`'s doc comment.
+        let mut input_stream_errors = Vec::new();
         let mut iter = input.char_indices().peekable();
         while let Some((byte_offset, c)) = iter.next() {
             let (emitted, skip_next) = if c == '\r' {
@@ -393,11 +419,24 @@ impl Tokenizer {
             } else {
                 (c, false)
             };
-            positions.push(Position {
+            let position = Position {
                 line,
                 column,
                 byte_offset,
-            });
+            };
+            let code = u32::from(emitted);
+            if is_noncharacter(code) {
+                input_stream_errors.push(ParseError {
+                    kind: ParseErrorKind::NoncharacterInInputStream,
+                    position,
+                });
+            } else if is_control(code) && code != 0x00 && !is_ascii_whitespace(code) {
+                input_stream_errors.push(ParseError {
+                    kind: ParseErrorKind::ControlCharacterInInputStream,
+                    position,
+                });
+            }
+            positions.push(position);
             chars.push(emitted);
             if emitted == '\n' {
                 line += 1;
@@ -446,7 +485,7 @@ impl Tokenizer {
             cdata_pending_brackets: Vec::new(),
             pending: VecDeque::new(),
             eof_returned: false,
-            errors: Vec::new(),
+            errors: input_stream_errors,
         }
     }
 
@@ -517,6 +556,19 @@ impl Tokenizer {
             .take()
             .expect("emit_tag called with no tag token in progress");
         let kind = if self.current_tag_is_end {
+            // end-tag-with-attributes / end-tag-with-trailing-solidus
+            // parse errors — detected at emission time (a property of
+            // the finished token), not a single input-character
+            // transition like every other error in this file.
+            if !tag.attributes.is_empty() {
+                self.error(ParseErrorKind::EndTagWithAttributes, self.current_tag_start);
+            }
+            if tag.self_closing {
+                self.error(
+                    ParseErrorKind::EndTagWithTrailingSolidus,
+                    self.current_tag_start,
+                );
+            }
             TokenKind::EndTag(tag)
         } else {
             // "appropriate end tag token" (§13.2.5) is defined against the
@@ -1617,15 +1669,35 @@ impl Tokenizer {
                     self.state = State::BeforeDoctypePublicIdentifier;
                     false
                 }
-                Some('"') => {
-                    self.start_doctype_public_identifier(State::DoctypePublicIdentifierDoubleQuoted)
+                Some(c @ ('"' | '\'')) => {
+                    // missing-whitespace-after-doctype-public-keyword
+                    // parse error.
+                    self.error(
+                        ParseErrorKind::MissingWhitespaceAfterDoctypePublicKeyword,
+                        position,
+                    );
+                    let quoted_state = if c == '"' {
+                        State::DoctypePublicIdentifierDoubleQuoted
+                    } else {
+                        State::DoctypePublicIdentifierSingleQuoted
+                    };
+                    self.start_doctype_public_identifier(quoted_state)
                 }
-                Some('\'') => {
-                    self.start_doctype_public_identifier(State::DoctypePublicIdentifierSingleQuoted)
+                Some('>') => {
+                    // missing-doctype-public-identifier parse error.
+                    self.error(ParseErrorKind::MissingDoctypePublicIdentifier, position);
+                    self.close_doctype_with_quirks(out)
                 }
-                Some('>') => self.close_doctype_with_quirks(out),
                 None => self.eof_in_doctype(out, position),
-                Some(_) => self.bogus_doctype_with_quirks(),
+                Some(_) => {
+                    // missing-quote-before-doctype-public-identifier
+                    // parse error.
+                    self.error(
+                        ParseErrorKind::MissingQuoteBeforeDoctypePublicIdentifier,
+                        position,
+                    );
+                    self.bogus_doctype_with_quirks()
+                }
             },
             State::BeforeDoctypePublicIdentifier => match ch {
                 Some(c) if Self::is_whitespace(c) => false,
@@ -1635,9 +1707,21 @@ impl Tokenizer {
                 Some('\'') => {
                     self.start_doctype_public_identifier(State::DoctypePublicIdentifierSingleQuoted)
                 }
-                Some('>') => self.close_doctype_with_quirks(out),
+                Some('>') => {
+                    // missing-doctype-public-identifier parse error.
+                    self.error(ParseErrorKind::MissingDoctypePublicIdentifier, position);
+                    self.close_doctype_with_quirks(out)
+                }
                 None => self.eof_in_doctype(out, position),
-                Some(_) => self.bogus_doctype_with_quirks(),
+                Some(_) => {
+                    // missing-quote-before-doctype-public-identifier
+                    // parse error.
+                    self.error(
+                        ParseErrorKind::MissingQuoteBeforeDoctypePublicIdentifier,
+                        position,
+                    );
+                    self.bogus_doctype_with_quirks()
+                }
             },
             State::DoctypePublicIdentifierDoubleQuoted => self.step_doctype_identifier_quoted(
                 ch,
@@ -1693,15 +1777,35 @@ impl Tokenizer {
                     self.state = State::BeforeDoctypeSystemIdentifier;
                     false
                 }
-                Some('"') => {
-                    self.start_doctype_system_identifier(State::DoctypeSystemIdentifierDoubleQuoted)
+                Some(c @ ('"' | '\'')) => {
+                    // missing-whitespace-after-doctype-system-keyword
+                    // parse error.
+                    self.error(
+                        ParseErrorKind::MissingWhitespaceAfterDoctypeSystemKeyword,
+                        position,
+                    );
+                    let quoted_state = if c == '"' {
+                        State::DoctypeSystemIdentifierDoubleQuoted
+                    } else {
+                        State::DoctypeSystemIdentifierSingleQuoted
+                    };
+                    self.start_doctype_system_identifier(quoted_state)
                 }
-                Some('\'') => {
-                    self.start_doctype_system_identifier(State::DoctypeSystemIdentifierSingleQuoted)
+                Some('>') => {
+                    // missing-doctype-system-identifier parse error.
+                    self.error(ParseErrorKind::MissingDoctypeSystemIdentifier, position);
+                    self.close_doctype_with_quirks(out)
                 }
-                Some('>') => self.close_doctype_with_quirks(out),
                 None => self.eof_in_doctype(out, position),
-                Some(_) => self.bogus_doctype_with_quirks(),
+                Some(_) => {
+                    // missing-quote-before-doctype-system-identifier
+                    // parse error.
+                    self.error(
+                        ParseErrorKind::MissingQuoteBeforeDoctypeSystemIdentifier,
+                        position,
+                    );
+                    self.bogus_doctype_with_quirks()
+                }
             },
             State::BeforeDoctypeSystemIdentifier => match ch {
                 Some(c) if Self::is_whitespace(c) => false,
@@ -1711,9 +1815,21 @@ impl Tokenizer {
                 Some('\'') => {
                     self.start_doctype_system_identifier(State::DoctypeSystemIdentifierSingleQuoted)
                 }
-                Some('>') => self.close_doctype_with_quirks(out),
+                Some('>') => {
+                    // missing-doctype-system-identifier parse error.
+                    self.error(ParseErrorKind::MissingDoctypeSystemIdentifier, position);
+                    self.close_doctype_with_quirks(out)
+                }
                 None => self.eof_in_doctype(out, position),
-                Some(_) => self.bogus_doctype_with_quirks(),
+                Some(_) => {
+                    // missing-quote-before-doctype-system-identifier
+                    // parse error.
+                    self.error(
+                        ParseErrorKind::MissingQuoteBeforeDoctypeSystemIdentifier,
+                        position,
+                    );
+                    self.bogus_doctype_with_quirks()
+                }
             },
             State::DoctypeSystemIdentifierDoubleQuoted => self.step_doctype_identifier_quoted(
                 ch,
@@ -2569,7 +2685,16 @@ impl Tokenizer {
                 self.doctype_identifier_mut(kind).push('\u{FFFD}');
                 false
             }
-            Some('>') => self.close_doctype_with_quirks(out),
+            Some('>') => {
+                // abrupt-doctype-public-identifier /
+                // abrupt-doctype-system-identifier parse error.
+                let error_kind = match kind {
+                    DoctypeIdentifierKind::Public => ParseErrorKind::AbruptDoctypePublicIdentifier,
+                    DoctypeIdentifierKind::System => ParseErrorKind::AbruptDoctypeSystemIdentifier,
+                };
+                self.error(error_kind, position);
+                self.close_doctype_with_quirks(out)
+            }
             None => self.eof_in_doctype(out, position),
             Some(c) => {
                 self.doctype_identifier_mut(kind).push(c);
@@ -3984,6 +4109,42 @@ mod tests {
                 "<?xml?>",
                 ParseErrorKind::DisallowedProcessingInstructionTarget,
             ),
+            (
+                r#"<!DOCTYPE html PUBLIC "ab>"#,
+                ParseErrorKind::AbruptDoctypePublicIdentifier,
+            ),
+            (
+                r#"<!DOCTYPE html SYSTEM "ab>"#,
+                ParseErrorKind::AbruptDoctypeSystemIdentifier,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC>",
+                ParseErrorKind::MissingDoctypePublicIdentifier,
+            ),
+            (
+                "<!DOCTYPE html SYSTEM>",
+                ParseErrorKind::MissingDoctypeSystemIdentifier,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC x>",
+                ParseErrorKind::MissingQuoteBeforeDoctypePublicIdentifier,
+            ),
+            (
+                "<!DOCTYPE html SYSTEM x>",
+                ParseErrorKind::MissingQuoteBeforeDoctypeSystemIdentifier,
+            ),
+            (
+                r#"<!DOCTYPE html PUBLIC"x">"#,
+                ParseErrorKind::MissingWhitespaceAfterDoctypePublicKeyword,
+            ),
+            (
+                r#"<!DOCTYPE html SYSTEM"x">"#,
+                ParseErrorKind::MissingWhitespaceAfterDoctypeSystemKeyword,
+            ),
+            ("<p></p a=1>", ParseErrorKind::EndTagWithAttributes),
+            ("<p></p/>", ParseErrorKind::EndTagWithTrailingSolidus),
+            ("\u{FFFE}", ParseErrorKind::NoncharacterInInputStream),
+            ("\u{1}", ParseErrorKind::ControlCharacterInInputStream),
         ];
         for (input, expected_kind) in cases {
             let errors = errors_for(input);
