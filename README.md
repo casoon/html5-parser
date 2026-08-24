@@ -44,12 +44,13 @@ implemented and wired end to end.
 each node's kind and source position, matching what `html-conform`'s
 `src/infoset.rs::normalize()` needs. `Tokenizer`/`TreeBuilder` and
 everything else stay crate-internal (see Scope above — no commitment to
-a generic public API yet, that's Step 2); not published to crates.io.
+a generic public API yet, that's Step 2). Published on crates.io as
+[`html5-parser`](https://crates.io/crates/html5-parser).
 
 ### Known limitations
 
 Three gaps were tracked here, evidence-based (per Step 1's scope, above)
-rather than oversights, closed out one by one ahead of a first
+rather than oversights, closed out one by one ahead of the first
 `crates.io` publish (see `plan/DECISIONS.md`), independently of whether
 `html-conform` itself ends up needing each one — **all three are now
 done**:
