@@ -209,6 +209,28 @@ impl Document {
         NodeId::from_index(self.nodes.len() - 1)
     }
 
+    /// "Clone a node", with `subtree` implicitly always `true` (the only
+    /// case this crate needs — `<selectedcontent>`'s option-content
+    /// mirroring, see `tree_builder.rs::maybe_clone_option_into_selectedcontent`).
+    /// Returns a new, detached node with the same kind as `source` (and,
+    /// recursively, the same for its descendants) — a full, independent
+    /// copy, not sharing any state with the original. No source
+    /// position (a clone has no position of its own, same convention as
+    /// any other synthesized node). Simplified from the DOM Standard's
+    /// "clone" algorithm: no custom-element callbacks, no
+    /// registered-observer copying, no `Document`/shadow-root special
+    /// cases — none apply without a live, scripted DOM.
+    pub(crate) fn clone_subtree(&mut self, source: NodeId) -> NodeId {
+        let kind = self.node(source).kind.clone();
+        let clone = self.new_node(kind, None);
+        let children: Vec<_> = self.children(source).collect();
+        for child in children {
+            let child_clone = self.clone_subtree(child);
+            self.append_child(clone, child_clone);
+        }
+        clone
+    }
+
     /// Detaches `node` from its current parent and siblings, if any — a
     /// no-op if it has none. The node itself stays in the arena (nothing
     /// is ever freed); it can be reinserted elsewhere afterward via
@@ -660,5 +682,47 @@ mod tests {
         assert!(document.is_inclusive_ancestor(root, span));
         assert!(!document.is_inclusive_ancestor(unrelated, span));
         assert!(!document.is_inclusive_ancestor(span, div));
+    }
+
+    #[test]
+    fn clone_subtree_deep_copies_kind_and_structure_into_new_nodes() {
+        let mut document = Document::new();
+        let root = document.root();
+        let original = document.new_node(
+            NodeKind::Element {
+                name: "b".to_owned(),
+                namespace: Some("http://www.w3.org/1999/xhtml".to_owned()),
+                attributes: vec![],
+            },
+            Some(pos(1, 1, 0)),
+        );
+        document.append_child(root, original);
+        let text = document.new_node(
+            NodeKind::Text {
+                content: "hi".to_owned(),
+            },
+            Some(pos(1, 4, 3)),
+        );
+        document.append_child(original, text);
+
+        let clone = document.clone_subtree(original);
+
+        assert_ne!(clone, original);
+        assert_eq!(document.node(clone).kind, document.node(original).kind);
+        // The clone is detached — the caller decides where it goes.
+        assert_eq!(document.parent(clone), None);
+        let clone_children: Vec<_> = document.children(clone).collect();
+        assert_eq!(clone_children.len(), 1);
+        assert_ne!(clone_children[0], text);
+        assert_eq!(
+            document.node(clone_children[0]).kind,
+            NodeKind::Text {
+                content: "hi".to_owned()
+            }
+        );
+        // A clone carries no position of its own.
+        assert_eq!(document.node(clone).position, None);
+        // The original is untouched.
+        assert_eq!(document.children(original).collect::<Vec<_>>(), vec![text]);
     }
 }

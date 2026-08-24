@@ -13,7 +13,3 @@
 # real bug) — never hand-add an entry just to silence a failure.
 # --- entries below, one per line ---
 
-webkit02.dat#44
-webkit02.dat#45
-webkit02.dat#46
-webkit02.dat#47

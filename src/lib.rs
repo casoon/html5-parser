@@ -27,9 +27,11 @@ use tree_builder::TreeBuilder;
 /// consulted only by CDATA-section handling).
 ///
 /// The tokenizer's iterator yields exactly one `Eof` token and then ends
-/// (`None`) on the next call, so the loop needs no separate stop condition
-/// — "stop parsing" (§13.2.6.4.7's EOF handling and similar) is simply
-/// "there are no more tokens".
+/// (`None`) on the next call, so the loop needs no separate condition for
+/// *when* to stop feeding it tokens. `TreeBuilder::stop_parsing` (§13.2.7
+/// "The end") still runs once, explicitly, right after — its one
+/// tree-shape-relevant step ("pop all the nodes off the stack of open
+/// elements") isn't implied by the loop simply ending.
 pub fn parse(input: &str) -> Document {
     let mut tokenizer = Tokenizer::new(input);
     let mut tree_builder = TreeBuilder::new();
@@ -39,6 +41,7 @@ pub fn parse(input: &str) -> Document {
         }
         tokenizer.set_in_foreign_content(tree_builder.is_in_foreign_content());
     }
+    tree_builder.stop_parsing();
     tree_builder.into_document()
 }
 
@@ -668,6 +671,29 @@ mod tests {
             document.node(content_children[0]).kind,
             NodeKind::Text {
                 content: "Hello".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn selected_option_content_is_mirrored_into_selectedcontent() {
+        // html5lib-tests' webkit02.dat#47: the explicitly `selected`
+        // option (not the first one) is the one mirrored, and — since
+        // it's the last token in the input — only `stop_parsing`'s
+        // final pop of the still-open `<option>` makes that observable.
+        let document =
+            parse("<select><button><selectedcontent></button><option>X<option selected>Y");
+        let body = body_of(&document);
+
+        let select = document.children(body).next().unwrap();
+        let button = document.children(select).next().unwrap();
+        let selectedcontent = document.children(button).next().unwrap();
+        let selectedcontent_children: Vec<_> = document.children(selectedcontent).collect();
+        assert_eq!(selectedcontent_children.len(), 1);
+        assert_eq!(
+            document.node(selectedcontent_children[0]).kind,
+            NodeKind::Text {
+                content: "Y".to_owned()
             }
         );
     }

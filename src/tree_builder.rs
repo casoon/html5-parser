@@ -1939,16 +1939,19 @@ impl TreeBuilder {
                     if namespace.as_deref() == Some(HTML_NAMESPACE) && name == &tag.name
             );
             if is_match {
-                self.open_elements
-                    .generate_implied_end_tags(&self.document, Some(tag.name.as_str()));
-                // "If node is not the current node, then this is a parse
-                // error" — parse-error-only, no tree-shape effect.
-                loop {
-                    let popped = self.open_elements.pop();
-                    if popped == Some(node) {
-                        break;
+                self.with_option_pop_hook(|this| {
+                    this.open_elements
+                        .generate_implied_end_tags(&this.document, Some(tag.name.as_str()));
+                    // "If node is not the current node, then this is a
+                    // parse error" — parse-error-only, no tree-shape
+                    // effect.
+                    loop {
+                        let popped = this.open_elements.pop();
+                        if popped == Some(node) {
+                            break;
+                        }
                     }
-                }
+                });
                 return;
             }
             if is_special(&self.document, node) {
@@ -2939,6 +2942,189 @@ impl TreeBuilder {
         )
     }
 
+    /// True if `node` is an HTML-namespace element with an attribute
+    /// named `attribute_name` (any value, including empty).
+    fn node_has_html_attribute(&self, node: NodeId, attribute_name: &str) -> bool {
+        matches!(
+            &self.document.node(node).kind,
+            NodeKind::Element { namespace, attributes, .. }
+                if namespace.as_deref() == Some(HTML_NAMESPACE)
+                    && attributes.iter().any(|attribute| attribute.name == attribute_name)
+        )
+    }
+
+    /// "Get the nearest ancestor `select`" (form-elements.html §4.10.10)
+    /// — walks `node`'s ancestors from nearest to furthest, tracking at
+    /// most one intervening `optgroup`; a `datalist`/`hr`/`option`
+    /// ancestor, or a *second* `optgroup`, disqualifies the walk
+    /// entirely (returns `None`) before it can reach a `select`.
+    fn nearest_ancestor_select(&self, node: NodeId) -> Option<NodeId> {
+        let mut ancestor_optgroup = None;
+        let mut current = self.document.parent(node);
+        while let Some(ancestor) = current {
+            if self.node_has_html_name(ancestor, "datalist")
+                || self.node_has_html_name(ancestor, "hr")
+                || self.node_has_html_name(ancestor, "option")
+            {
+                return None;
+            }
+            if self.node_has_html_name(ancestor, "optgroup") {
+                if ancestor_optgroup.is_some() {
+                    return None;
+                }
+                ancestor_optgroup = Some(ancestor);
+            }
+            if self.node_has_html_name(ancestor, "select") {
+                return Some(ancestor);
+            }
+            current = self.document.parent(ancestor);
+        }
+        None
+    }
+
+    /// "Get the list of options" (form-elements.html §4.10.7),
+    /// practically scoped: `option` elements that are either direct
+    /// children of `select`, or direct children of an `optgroup` that
+    /// is itself a direct child of `select` — covers ordinary
+    /// `<select>`/`<option>`/`<optgroup>` markup (and everything the
+    /// html5lib-tests corpus's `<selectedcontent>` cases use) without a
+    /// general tree-order walker with subtree-skipping, which the real
+    /// algorithm technically requires for exotic nesting no test here
+    /// exercises. See plan/06-selectedcontent.md.
+    fn list_of_options(&self, select: NodeId) -> Vec<NodeId> {
+        let mut options = Vec::new();
+        for child in self.document.children(select) {
+            if self.node_has_html_name(child, "option") {
+                options.push(child);
+            } else if self.node_has_html_name(child, "optgroup") {
+                options.extend(
+                    self.document
+                        .children(child)
+                        .filter(|&grandchild| self.node_has_html_name(grandchild, "option")),
+                );
+            }
+        }
+        options
+    }
+
+    /// The option that would be "selected" in `select` right now, per
+    /// the selectedness setting algorithm's two rules (form-elements.html
+    /// §4.10.7) collapsed into a single query: this crate never mutates
+    /// an option's selectedness after the fact (no scripting, no form
+    /// resets, no live DOM) — a `selected` attribute is the only way an
+    /// option's selectedness ever becomes (and stays) true, and "no
+    /// option selected yet" always means the first (non-`disabled`) one
+    /// defaults to selected. Re-deriving this from current attribute
+    /// state on demand, rather than maintaining a separate mutable
+    /// selectedness flag per option that would need updating on every
+    /// insertion, gives the same answer at every point during parsing
+    /// (each is evaluated only against however many options exist in
+    /// the tree so far, exactly matching the incremental algorithm's own
+    /// per-insertion re-evaluation).
+    fn selected_option_of(&self, select: NodeId) -> Option<NodeId> {
+        let options = self.list_of_options(select);
+        options
+            .iter()
+            .rev()
+            .find(|&&option| self.node_has_html_attribute(option, "selected"))
+            .copied()
+            .or_else(|| {
+                options
+                    .into_iter()
+                    .find(|&option| !self.node_has_html_attribute(option, "disabled"))
+            })
+    }
+
+    /// "Get a `select`'s enabled `selectedcontent`" (form-elements.html
+    /// §4.10.17), simplified: skips the `disabled` flag a
+    /// `selectedcontent` element can carry from its own "post-connection
+    /// steps" (only relevant for exotic nesting — a `selectedcontent`
+    /// inside a *second*, unrelated `select`/`option` — this crate's
+    /// namesake corpus cases never trigger it, see
+    /// plan/06-selectedcontent.md).
+    fn first_selectedcontent_descendant(&self, select: NodeId) -> Option<NodeId> {
+        if self.node_has_html_attribute(select, "multiple") {
+            return None;
+        }
+        self.first_descendant_matching(select, "selectedcontent")
+    }
+
+    /// Depth-first, tree-order search for the first descendant of
+    /// `node` with HTML tag name `name`.
+    fn first_descendant_matching(&self, node: NodeId, name: &str) -> Option<NodeId> {
+        for child in self.document.children(node) {
+            if self.node_has_html_name(child, name) {
+                return Some(child);
+            }
+            if let Some(found) = self.first_descendant_matching(child, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// "Maybe clone an `option` into `selectedcontent`" (form-elements.html
+    /// §4.10.10), run "when an `option` element is popped off the stack
+    /// of open elements" — see
+    /// [`with_option_pop_hook`](Self::with_option_pop_hook) for how (and
+    /// which) pops actually trigger this call.
+    fn maybe_clone_option_into_selectedcontent(&mut self, option: NodeId) {
+        let Some(select) = self.nearest_ancestor_select(option) else {
+            return;
+        };
+        if self.selected_option_of(select) != Some(option) {
+            return;
+        }
+        let Some(selectedcontent) = self.first_selectedcontent_descendant(select) else {
+            return;
+        };
+        // "Clone an option into a selectedcontent": replace all of
+        // `selectedcontent`'s children with fresh, deep clones of
+        // `option`'s own children.
+        let existing_children: Vec<_> = self.document.children(selectedcontent).collect();
+        for child in existing_children {
+            self.document.remove(child);
+        }
+        let option_children: Vec<_> = self.document.children(option).collect();
+        for child in option_children {
+            let clone = self.document.clone_subtree(child);
+            self.document.append_child(selectedcontent, clone);
+        }
+    }
+
+    /// Runs `f`, then runs
+    /// [`maybe_clone_option_into_selectedcontent`](Self::maybe_clone_option_into_selectedcontent)
+    /// for every `option` element `f` popped off the stack of open
+    /// elements, in the order they were actually popped (most-recently-
+    /// popped first) — form-elements.html's real trigger for that hook
+    /// is simply "when an `option` element is popped", full stop,
+    /// regardless of *why*, but plumbing a callback through every
+    /// pop-driving helper (`generate_implied_end_tags`,
+    /// `pop_until_one_of_popped`, ...) down to a single `Vec::pop` call
+    /// would touch most of this file for cases this crate's corpus
+    /// doesn't exercise. Comparing the stack before/after instead keeps
+    /// the hook centralized at only the call sites that matter for
+    /// `<select>` content (see its own call sites) — not a fully general
+    /// interception of every possible pop, a deliberate practical scope,
+    /// see plan/06-selectedcontent.md.
+    fn with_option_pop_hook<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let before: Vec<NodeId> = self.open_elements.entries.clone();
+        let result = f(self);
+        let after_len = self.open_elements.entries.len();
+        // `f` is only ever passed pop-driving calls here (see call
+        // sites) — `after_len <= before.len()` always holds in
+        // practice, but this isn't the place to panic if that
+        // invariant is ever violated by a future caller.
+        if after_len <= before.len() {
+            for &node in before[after_len..].iter().rev() {
+                if self.node_has_html_name(node, "option") {
+                    self.maybe_clone_option_into_selectedcontent(node);
+                }
+            }
+        }
+        result
+    }
+
     /// True if `node` is an element in the HTML namespace, regardless
     /// of tag name — the tree-construction dispatcher's (§13.2.6)
     /// primary foreign-vs-HTML-content test.
@@ -2978,6 +3164,22 @@ impl TreeBuilder {
     pub(crate) fn is_in_foreign_content(&self) -> bool {
         self.adjusted_current_node()
             .is_some_and(|node| !self.is_html_namespace_element(node))
+    }
+
+    /// "Stop parsing" (§13.2.7 "The end"), run by the driver loop
+    /// (`lib.rs::parse`) once the tokenizer has no more tokens, right
+    /// before [`into_document`](Self::into_document). Almost every real
+    /// step here (readiness-state changes, `DOMContentLoaded`/`load`
+    /// events, running deferred scripts, speculative-parser teardown)
+    /// has no tree-shape effect and isn't implemented (no scripting,
+    /// single-pass parser) — except "pop all the nodes off the stack of
+    /// open elements", which for real: popping an `option` element can
+    /// itself run "maybe clone an option into selectedcontent" (see
+    /// `with_option_pop_hook`'s doc comment), so a `<select>` left open
+    /// at EOF still needs its final selected `<option>`'s content
+    /// mirrored.
+    pub(crate) fn stop_parsing(&mut self) {
+        self.with_option_pop_hook(|this| while this.open_elements.pop().is_some() {});
     }
 
     /// Consumes the builder and returns the finished [`Document`] — the
@@ -4204,37 +4406,41 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "option" => {
-                if self
-                    .open_elements
-                    .has_element_in_scope(&self.document, "select")
-                {
-                    self.open_elements
-                        .generate_implied_end_tags(&self.document, Some("optgroup"));
-                } else if self
-                    .open_elements
-                    .current_node()
-                    .is_some_and(|node| self.node_has_html_name(node, "option"))
-                {
-                    self.open_elements.pop();
-                }
+                self.with_option_pop_hook(|this| {
+                    if this
+                        .open_elements
+                        .has_element_in_scope(&this.document, "select")
+                    {
+                        this.open_elements
+                            .generate_implied_end_tags(&this.document, Some("optgroup"));
+                    } else if this
+                        .open_elements
+                        .current_node()
+                        .is_some_and(|node| this.node_has_html_name(node, "option"))
+                    {
+                        this.open_elements.pop();
+                    }
+                });
                 self.reconstruct_the_active_formatting_elements();
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "optgroup" => {
-                if self
-                    .open_elements
-                    .has_element_in_scope(&self.document, "select")
-                {
-                    self.open_elements
-                        .generate_implied_end_tags(&self.document, None);
-                } else if self
-                    .open_elements
-                    .current_node()
-                    .is_some_and(|node| self.node_has_html_name(node, "option"))
-                {
-                    self.open_elements.pop();
-                }
+                self.with_option_pop_hook(|this| {
+                    if this
+                        .open_elements
+                        .has_element_in_scope(&this.document, "select")
+                    {
+                        this.open_elements
+                            .generate_implied_end_tags(&this.document, None);
+                    } else if this
+                        .open_elements
+                        .current_node()
+                        .is_some_and(|node| this.node_has_html_name(node, "option"))
+                    {
+                        this.open_elements.pop();
+                    }
+                });
                 self.reconstruct_the_active_formatting_elements();
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(None)
@@ -7973,6 +8179,92 @@ mod insertion_mode_tests {
                 namespace: Some(super::SVG_NAMESPACE.to_owned()),
                 attributes: vec![],
             }
+        );
+    }
+
+    /// Drives a fresh builder through `<select><button><selectedcontent>
+    /// </button>` — the common prefix of every `<selectedcontent>` test
+    /// below (mirrors html5lib-tests' `webkit02.dat`#44-47). Returns
+    /// `(select, selectedcontent)`.
+    fn bootstrap_select_with_selectedcontent(builder: &mut TreeBuilder) -> (NodeId, NodeId) {
+        bootstrap_in_body(builder);
+        builder.process_token(&start_tag("select"), pos());
+        let select = builder.open_elements.current_node().unwrap();
+        builder.process_token(&start_tag("button"), pos());
+        builder.process_token(&start_tag("selectedcontent"), pos());
+        let selectedcontent = builder.open_elements.current_node().unwrap();
+        builder.process_token(&end_tag("button"), pos());
+        (select, selectedcontent)
+    }
+
+    fn text_content_of(builder: &TreeBuilder, node: NodeId) -> String {
+        builder
+            .document
+            .children(node)
+            .map(|child| match &builder.document.node(child).kind {
+                NodeKind::Text { content } => content.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn second_option_start_tag_clones_the_default_selected_first_option() {
+        // html5lib-tests webkit02.dat#44/#46: neither `<option>` has
+        // `selected` — the first one is selected by default, and gets
+        // mirrored into `<selectedcontent>` when the second `<option>`
+        // start tag implicitly closes (pops) it.
+        let mut builder = TreeBuilder::new();
+        let (_, selectedcontent) = bootstrap_select_with_selectedcontent(&mut builder);
+
+        builder.process_token(&start_tag("option"), pos());
+        builder.process_token(&TokenKind::Character('X'), pos());
+        builder.process_token(&start_tag("option"), pos());
+        builder.process_token(&TokenKind::Character('Y'), pos());
+
+        assert_eq!(text_content_of(&builder, selectedcontent), "X");
+    }
+
+    #[test]
+    fn stop_parsing_reclones_a_later_option_that_becomes_selected() {
+        // html5lib-tests webkit02.dat#47: the second (`selected`)
+        // `<option>` is still open when parsing ends — never popped by
+        // a following sibling, only by `stop_parsing`'s final
+        // pop-everything step, which must still run the clone hook.
+        let mut builder = TreeBuilder::new();
+        let (_, selectedcontent) = bootstrap_select_with_selectedcontent(&mut builder);
+
+        builder.process_token(&start_tag("option"), pos());
+        builder.process_token(&TokenKind::Character('X'), pos());
+        builder.process_token(&start_tag_with_attrs("option", &[("selected", "")]), pos());
+        builder.process_token(&TokenKind::Character('Y'), pos());
+        // Before EOF: the second `<option>` was never popped, so the
+        // first clone (from popping the first `<option>`) is still the
+        // last thing that happened.
+        assert_eq!(text_content_of(&builder, selectedcontent), "X");
+
+        builder.stop_parsing();
+
+        assert_eq!(text_content_of(&builder, selectedcontent), "Y");
+    }
+
+    #[test]
+    fn selectedcontent_clone_is_a_deep_copy_not_a_reference() {
+        let mut builder = TreeBuilder::new();
+        let (_, selectedcontent) = bootstrap_select_with_selectedcontent(&mut builder);
+
+        builder.process_token(&start_tag("option"), pos());
+        let option = builder.open_elements.current_node().unwrap();
+        builder.process_token(&TokenKind::Character('X'), pos());
+
+        builder.stop_parsing();
+
+        let cloned_text = builder.document.children(selectedcontent).next().unwrap();
+        let original_text = builder.document.children(option).next().unwrap();
+        assert_ne!(cloned_text, original_text);
+        assert_eq!(
+            builder.document.node(cloned_text).kind,
+            builder.document.node(original_text).kind
         );
     }
 }
