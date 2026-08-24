@@ -8,5 +8,10 @@ repository = "https://github.com/casoon/html5-parser"
 readme = "README.md"
 keywords = ["html5", "html", "parser", "tokenizer", "whatwg"]
 categories = ["parser-implementations", "web-programming"]
+# tests/ (the html5lib-tests corpus + this crate's conformance harness)
+# is dev-only — no value to library consumers, but ~616KiB of vendored
+# .dat fixtures otherwise bloats the published package. Excluded here
+# only; unaffected in the git repo/CI, where `cargo test` still needs it.
+exclude = ["tests/"]
 
 [dependencies]
