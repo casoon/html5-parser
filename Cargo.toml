@@ -5,5 +5,8 @@ edition = "2024"
 description = "A pure-Rust WHATWG HTML5 tokenizer and tree-construction implementation"
 license = "MIT"
 repository = "https://github.com/casoon/html5-parser"
+readme = "README.md"
+keywords = ["html5", "html", "parser", "tokenizer", "whatwg"]
+categories = ["parser-implementations", "web-programming"]
 
 [dependencies]
