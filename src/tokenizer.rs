@@ -23,6 +23,75 @@ pub struct Position {
     pub byte_offset: usize,
 }
 
+/// A single WHATWG "parse error" (§13.2.2) — a point where the input
+/// deviated from strict grammar but the tokenizer still recovered per its
+/// own well-defined algorithm. Never fatal: [`crate::Document`]
+/// construction always completes regardless of how many of these occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub position: Position,
+}
+
+/// Which WHATWG "parse error" (§13.2.2) occurred. Variant names mirror
+/// the spec's own kebab-case error identifiers, translated to
+/// PascalCase. Only variants this crate actually detects and reports
+/// exist — no catch-all/string-payload variant, so matching on a
+/// specific kind stays meaningful. `#[non_exhaustive]` because more
+/// variants are expected in follow-up phases (`plan/07-parse-errors.md`:
+/// tokenizer-level errors only so far — tree-construction-level errors,
+/// e.g. stray end tags across the whole document, are follow-up work,
+/// not yet represented here) — adding one later must not be a breaking
+/// change for any caller matching on this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseErrorKind {
+    // Markup declaration open / comments (§13.2.5.42, .45–.52)
+    CdataInHtmlContent,
+    IncorrectlyOpenedComment,
+    AbruptClosingOfEmptyComment,
+    NestedComment,
+    IncorrectlyClosedComment,
+    EofInComment,
+    // Tag open / attributes (§13.2.5.6–.41)
+    InvalidFirstCharacterOfTagName,
+    EofBeforeTagName,
+    MissingEndTagName,
+    EofInTag,
+    DuplicateAttribute,
+    UnexpectedNullCharacter,
+    UnexpectedCharacterInAttributeName,
+    MissingAttributeValue,
+    UnexpectedCharacterInUnquotedAttributeValue,
+    MissingWhitespaceBetweenAttributes,
+    UnexpectedSolidusInTag,
+    UnexpectedEqualsSignBeforeAttributeName,
+    // Character references (§13.2.5.77–.84)
+    UnknownNamedCharacterReference,
+    AbsenceOfDigitsInNumericCharacterReference,
+    MissingSemicolonAfterCharacterReference,
+    NullCharacterReference,
+    CharacterReferenceOutsideUnicodeRange,
+    SurrogateCharacterReference,
+    NoncharacterCharacterReference,
+    ControlCharacterReference,
+    // DOCTYPE (§13.2.5.53–.68)
+    MissingWhitespaceBeforeDoctypeName,
+    MissingDoctypeName,
+    InvalidCharacterSequenceAfterDoctypeName,
+    MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers,
+    UnexpectedCharacterAfterDoctypeSystemIdentifier,
+    EofInDoctype,
+    // Processing instructions (§13.2.5.73–.76)
+    EofInProcessingInstruction,
+    InvalidFirstCharacterOfProcessingInstructionTarget,
+    InvalidProcessingInstructionTarget,
+    DisallowedProcessingInstructionTarget,
+    // Text content (§13.2.5.x script-data-like/CDATA states)
+    EofInScriptHtmlCommentLikeText,
+    EofInCdata,
+}
+
 /// A single `name=value` attribute on a start or end tag token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Attribute {
@@ -299,6 +368,11 @@ pub(crate) struct Tokenizer {
     cdata_pending_brackets: Vec<Position>,
     pending: VecDeque<Token>,
     eof_returned: bool,
+    /// Accumulated [`ParseError`]s, in the order encountered. Drained
+    /// once by [`Tokenizer::take_errors`] after tokenization finishes
+    /// (see `lib.rs::parse`) — never read mid-stream, so plain
+    /// accumulation (not a queue like `pending`) is enough.
+    errors: Vec<ParseError>,
 }
 
 impl Tokenizer {
@@ -372,7 +446,22 @@ impl Tokenizer {
             cdata_pending_brackets: Vec::new(),
             pending: VecDeque::new(),
             eof_returned: false,
+            errors: Vec::new(),
         }
+    }
+
+    /// Records a [`ParseError`] at `position`. Called at every point in
+    /// the state machine below marked with a `// <kebab-case-name> parse
+    /// error.` comment (identified during Phase 02's spec research,
+    /// implemented in Phase 07 — see `plan/07-parse-errors.md`).
+    fn error(&mut self, kind: ParseErrorKind, position: Position) {
+        self.errors.push(ParseError { kind, position });
+    }
+
+    /// Drains and returns every [`ParseError`] recorded so far. Called
+    /// once by `lib.rs::parse` after tokenization finishes.
+    pub(crate) fn take_errors(&mut self) -> Vec<ParseError> {
+        std::mem::take(&mut self.errors)
     }
 
     /// Called by the tree-builder (Phase 03) right after it inserts an
@@ -526,8 +615,10 @@ impl Tokenizer {
     /// The common `eof-in-doctype` handling shared by every DOCTYPE
     /// sub-state *except* the DOCTYPE state itself (13.2.5.53), which is
     /// reached before any token exists yet and so creates one first
-    /// instead of assuming one is already in progress.
+    /// instead of assuming one is already in progress (that site reports
+    /// the same error itself, see its own call site).
     fn eof_in_doctype(&mut self, out: &mut Vec<Token>, position: Position) -> bool {
+        self.error(ParseErrorKind::EofInDoctype, position);
         self.current_doctype_mut().force_quirks = true;
         self.emit_doctype(out);
         push_eof(out, position);
@@ -610,12 +701,20 @@ impl Tokenizer {
                 self.state = State::CdataSection;
             } else {
                 // cdata-in-html-content parse error.
+                self.error(
+                    ParseErrorKind::CdataInHtmlContent,
+                    self.positions[self.index],
+                );
                 self.current_comment_data = "[CDATA[".to_owned();
                 self.state = State::BogusComment;
             }
             return;
         }
         // incorrectly-opened-comment parse error; don't consume anything.
+        self.error(
+            ParseErrorKind::IncorrectlyOpenedComment,
+            self.positions[self.index],
+        );
         self.current_comment_data.clear();
         self.state = State::BogusComment;
     }
@@ -625,7 +724,7 @@ impl Tokenizer {
     /// name onto the current tag token (or discards it, if it duplicates
     /// an already-present name), and points `attribute_value_target` at
     /// where any following value characters should go.
-    fn commit_attribute_name(&mut self) {
+    fn commit_attribute_name(&mut self, position: Position) {
         let name = std::mem::take(&mut self.current_attribute_name);
         let tag = self
             .current_tag
@@ -638,6 +737,7 @@ impl Tokenizer {
         {
             // duplicate-attribute parse error: this attribute (and its
             // value, once parsed) is discarded — the earlier one wins.
+            self.error(ParseErrorKind::DuplicateAttribute, position);
             self.attribute_value_target = AttributeValueTarget::Discarded;
         } else {
             tag.attributes.push(Attribute {
@@ -710,10 +810,15 @@ impl Tokenizer {
                     self.state = State::TagOpen;
                     false
                 }
+                Some('\0') => {
+                    // unexpected-null-character parse error, but — unlike
+                    // RCDATA/RAWTEXT/script-data — the Data state does
+                    // *not* replace it with U+FFFD, per spec.
+                    self.error(ParseErrorKind::UnexpectedNullCharacter, position);
+                    push_character(out, '\0', position);
+                    false
+                }
                 Some(c) => {
-                    // '\0' is an unexpected-null-character parse error,
-                    // but — unlike RCDATA/RAWTEXT/script-data — the Data
-                    // state does *not* replace it with U+FFFD, per spec.
                     push_character(out, c, position);
                     false
                 }
@@ -744,12 +849,14 @@ impl Tokenizer {
                 }
                 Some(_) => {
                     // invalid-first-character-of-tag-name parse error.
+                    self.error(ParseErrorKind::InvalidFirstCharacterOfTagName, position);
                     push_character(out, '<', self.current_tag_start);
                     self.state = State::Data;
                     true
                 }
                 None => {
                     // eof-before-tag-name parse error.
+                    self.error(ParseErrorKind::EofBeforeTagName, position);
                     push_character(out, '<', self.current_tag_start);
                     push_eof(out, position);
                     false
@@ -763,17 +870,20 @@ impl Tokenizer {
                 }
                 Some('>') => {
                     // missing-end-tag-name parse error.
+                    self.error(ParseErrorKind::MissingEndTagName, position);
                     self.state = State::Data;
                     false
                 }
                 Some(_) => {
                     // invalid-first-character-of-tag-name parse error.
+                    self.error(ParseErrorKind::InvalidFirstCharacterOfTagName, position);
                     self.current_comment_data.clear();
                     self.state = State::BogusComment;
                     true
                 }
                 None => {
                     // eof-before-tag-name parse error.
+                    self.error(ParseErrorKind::EofBeforeTagName, position);
                     push_character(out, '<', self.current_tag_start);
                     push_character(out, '/', self.slash_position);
                     push_eof(out, position);
@@ -804,6 +914,7 @@ impl Tokenizer {
                 }
                 None => {
                     // eof-in-tag parse error: no tag token is emitted.
+                    self.error(ParseErrorKind::EofInTag, position);
                     push_eof(out, position);
                     false
                 }
@@ -818,6 +929,10 @@ impl Tokenizer {
                     // unexpected-equals-sign-before-attribute-name parse
                     // error, but still starts an attribute literally
                     // named "=".
+                    self.error(
+                        ParseErrorKind::UnexpectedEqualsSignBeforeAttributeName,
+                        position,
+                    );
                     self.current_attribute_name.clear();
                     self.current_attribute_name.push('=');
                     self.state = State::AttributeName;
@@ -831,17 +946,17 @@ impl Tokenizer {
             },
             State::AttributeName => match ch {
                 Some(c) if Self::is_whitespace(c) || c == '/' || c == '>' => {
-                    self.commit_attribute_name();
+                    self.commit_attribute_name(position);
                     self.state = State::AfterAttributeName;
                     true
                 }
                 None => {
-                    self.commit_attribute_name();
+                    self.commit_attribute_name(position);
                     self.state = State::AfterAttributeName;
                     true
                 }
                 Some('=') => {
-                    self.commit_attribute_name();
+                    self.commit_attribute_name(position);
                     self.state = State::BeforeAttributeValue;
                     false
                 }
@@ -853,10 +968,14 @@ impl Tokenizer {
                     self.current_attribute_name.push('\u{FFFD}');
                     false
                 }
+                Some(c @ ('"' | '\'' | '<')) => {
+                    // unexpected-character-in-attribute-name parse error,
+                    // but still appended as-is, per spec.
+                    self.error(ParseErrorKind::UnexpectedCharacterInAttributeName, position);
+                    self.current_attribute_name.push(c);
+                    false
+                }
                 Some(c) => {
-                    // '"', '\'', '<' are an unexpected-character-in-
-                    // attribute-name parse error here but still appended
-                    // as-is, per spec.
                     self.current_attribute_name.push(c);
                     false
                 }
@@ -873,6 +992,8 @@ impl Tokenizer {
                 }
                 Some('>') => self.close_tag(out),
                 None => {
+                    // eof-in-tag parse error.
+                    self.error(ParseErrorKind::EofInTag, position);
                     push_eof(out, position);
                     false
                 }
@@ -894,6 +1015,7 @@ impl Tokenizer {
                 }
                 Some('>') => {
                     // missing-attribute-value parse error.
+                    self.error(ParseErrorKind::MissingAttributeValue, position);
                     self.close_tag(out)
                 }
                 _ => {
@@ -921,14 +1043,23 @@ impl Tokenizer {
                     self.push_attribute_value_char('\u{FFFD}');
                     false
                 }
+                Some(c @ ('"' | '\'' | '<' | '=' | '`')) => {
+                    // unexpected-character-in-unquoted-attribute-value
+                    // parse error, but still appended as-is, per spec.
+                    self.error(
+                        ParseErrorKind::UnexpectedCharacterInUnquotedAttributeValue,
+                        position,
+                    );
+                    self.push_attribute_value_char(c);
+                    false
+                }
                 Some(c) => {
-                    // '"', '\'', '<', '=', '`' are an unexpected-character-
-                    // in-unquoted-attribute-value parse error here but
-                    // still appended as-is, per spec.
                     self.push_attribute_value_char(c);
                     false
                 }
                 None => {
+                    // eof-in-tag parse error.
+                    self.error(ParseErrorKind::EofInTag, position);
                     push_eof(out, position);
                     false
                 }
@@ -944,11 +1075,14 @@ impl Tokenizer {
                 }
                 Some('>') => self.close_tag(out),
                 None => {
+                    // eof-in-tag parse error.
+                    self.error(ParseErrorKind::EofInTag, position);
                     push_eof(out, position);
                     false
                 }
                 Some(_) => {
                     // missing-whitespace-between-attributes parse error.
+                    self.error(ParseErrorKind::MissingWhitespaceBetweenAttributes, position);
                     self.state = State::BeforeAttributeName;
                     true
                 }
@@ -959,11 +1093,14 @@ impl Tokenizer {
                     self.close_tag(out)
                 }
                 None => {
+                    // eof-in-tag parse error.
+                    self.error(ParseErrorKind::EofInTag, position);
                     push_eof(out, position);
                     false
                 }
                 Some(_) => {
                     // unexpected-solidus-in-tag parse error.
+                    self.error(ParseErrorKind::UnexpectedSolidusInTag, position);
                     self.state = State::BeforeAttributeName;
                     true
                 }
@@ -1001,6 +1138,7 @@ impl Tokenizer {
                 }
                 Some(';') => {
                     // unknown-named-character-reference parse error.
+                    self.error(ParseErrorKind::UnknownNamedCharacterReference, position);
                     self.state = self.return_state;
                     true
                 }
@@ -1026,6 +1164,10 @@ impl Tokenizer {
                         // chars) here — see the CharacterReference state's
                         // fallback above for why this is a fixed offset
                         // rather than derived from `self.index`.
+                        self.error(
+                            ParseErrorKind::AbsenceOfDigitsInNumericCharacterReference,
+                            position,
+                        );
                         let end = self.character_reference_start_index + 2;
                         self.flush_literal_character_reference_attempt(end, out);
                         self.state = self.return_state;
@@ -1042,6 +1184,10 @@ impl Tokenizer {
                     // absence-of-digits-in-numeric-character-reference
                     // parse error. Buffer is always exactly "&#x"/"&#X" (3
                     // chars) here — same fixed-offset reasoning as above.
+                    self.error(
+                        ParseErrorKind::AbsenceOfDigitsInNumericCharacterReference,
+                        position,
+                    );
                     let end = self.character_reference_start_index + 3;
                     self.flush_literal_character_reference_attempt(end, out);
                     self.state = self.return_state;
@@ -1077,6 +1223,10 @@ impl Tokenizer {
                 _ => {
                     // missing-semicolon-after-character-reference parse
                     // error.
+                    self.error(
+                        ParseErrorKind::MissingSemicolonAfterCharacterReference,
+                        position,
+                    );
                     self.state = State::NumericCharacterReferenceEnd;
                     true
                 }
@@ -1096,6 +1246,10 @@ impl Tokenizer {
                 _ => {
                     // missing-semicolon-after-character-reference parse
                     // error.
+                    self.error(
+                        ParseErrorKind::MissingSemicolonAfterCharacterReference,
+                        position,
+                    );
                     self.state = State::NumericCharacterReferenceEnd;
                     true
                 }
@@ -1104,7 +1258,8 @@ impl Tokenizer {
                 // §13.2.5.84 does not consume an input character at all —
                 // whatever `ch` is must be handed on, unconsumed, to
                 // `return_state`.
-                let resolved = self.resolve_numeric_character_reference_code();
+                let resolved =
+                    self.resolve_numeric_character_reference_code(self.character_reference_start);
                 self.flush_char_as_character_reference(
                     resolved,
                     self.character_reference_start,
@@ -1145,6 +1300,7 @@ impl Tokenizer {
                 }
                 Some('>') => {
                     // abrupt-closing-of-empty-comment parse error.
+                    self.error(ParseErrorKind::AbruptClosingOfEmptyComment, position);
                     self.state = State::Data;
                     self.emit_comment(out);
                     false
@@ -1161,11 +1317,14 @@ impl Tokenizer {
                 }
                 Some('>') => {
                     // abrupt-closing-of-empty-comment parse error.
+                    self.error(ParseErrorKind::AbruptClosingOfEmptyComment, position);
                     self.state = State::Data;
                     self.emit_comment(out);
                     false
                 }
                 None => {
+                    // eof-in-comment parse error.
+                    self.error(ParseErrorKind::EofInComment, position);
                     self.emit_comment(out);
                     push_eof(out, position);
                     false
@@ -1191,6 +1350,8 @@ impl Tokenizer {
                     false
                 }
                 None => {
+                    // eof-in-comment parse error.
+                    self.error(ParseErrorKind::EofInComment, position);
                     self.emit_comment(out);
                     push_eof(out, position);
                     false
@@ -1239,7 +1400,10 @@ impl Tokenizer {
                 // Both the '>'/EOF branch and the "anything else"
                 // (nested-comment parse error) branch reconsume in the
                 // same state; they differ only in whether a parse error
-                // is flagged, which isn't tracked here.
+                // is flagged.
+                if !matches!(ch, Some('>') | None) {
+                    self.error(ParseErrorKind::NestedComment, position);
+                }
                 self.state = State::CommentEnd;
                 true
             }
@@ -1249,6 +1413,8 @@ impl Tokenizer {
                     false
                 }
                 None => {
+                    // eof-in-comment parse error.
+                    self.error(ParseErrorKind::EofInComment, position);
                     self.emit_comment(out);
                     push_eof(out, position);
                     false
@@ -1274,6 +1440,8 @@ impl Tokenizer {
                     false
                 }
                 None => {
+                    // eof-in-comment parse error.
+                    self.error(ParseErrorKind::EofInComment, position);
                     self.emit_comment(out);
                     push_eof(out, position);
                     false
@@ -1292,11 +1460,14 @@ impl Tokenizer {
                 }
                 Some('>') => {
                     // incorrectly-closed-comment parse error.
+                    self.error(ParseErrorKind::IncorrectlyClosedComment, position);
                     self.state = State::Data;
                     self.emit_comment(out);
                     false
                 }
                 None => {
+                    // eof-in-comment parse error.
+                    self.error(ParseErrorKind::EofInComment, position);
                     self.emit_comment(out);
                     push_eof(out, position);
                     false
@@ -1317,9 +1488,11 @@ impl Tokenizer {
                     true
                 }
                 None => {
-                    // No DOCTYPE token exists yet at this point — unlike
-                    // every other DOCTYPE sub-state's eof-in-doctype
-                    // handling, one must be created first.
+                    // eof-in-doctype parse error. No DOCTYPE token exists
+                    // yet at this point — unlike every other DOCTYPE
+                    // sub-state's eof-in-doctype handling, one must be
+                    // created first.
+                    self.error(ParseErrorKind::EofInDoctype, position);
                     self.current_doctype = Some(DoctypeToken {
                         force_quirks: true,
                         ..Default::default()
@@ -1330,6 +1503,7 @@ impl Tokenizer {
                 }
                 Some(_) => {
                     // missing-whitespace-before-doctype-name parse error.
+                    self.error(ParseErrorKind::MissingWhitespaceBeforeDoctypeName, position);
                     self.state = State::BeforeDoctypeName;
                     true
                 }
@@ -1353,6 +1527,8 @@ impl Tokenizer {
                     false
                 }
                 Some('>') => {
+                    // missing-doctype-name parse error.
+                    self.error(ParseErrorKind::MissingDoctypeName, position);
                     self.current_doctype = Some(DoctypeToken {
                         force_quirks: true,
                         ..Default::default()
@@ -1360,6 +1536,8 @@ impl Tokenizer {
                     self.close_doctype(out)
                 }
                 None => {
+                    // eof-in-doctype parse error.
+                    self.error(ParseErrorKind::EofInDoctype, position);
                     self.current_doctype = Some(DoctypeToken {
                         force_quirks: true,
                         ..Default::default()
@@ -1426,6 +1604,10 @@ impl Tokenizer {
                     } else {
                         // invalid-character-sequence-after-doctype-name
                         // parse error.
+                        self.error(
+                            ParseErrorKind::InvalidCharacterSequenceAfterDoctypeName,
+                            position,
+                        );
                         self.bogus_doctype_with_quirks()
                     }
                 }
@@ -1477,13 +1659,19 @@ impl Tokenizer {
                     false
                 }
                 Some('>') => self.close_doctype(out),
-                // '"'/'\'': missing-whitespace-between-doctype-public-and-
-                // system-identifiers parse error.
-                Some('"') => {
-                    self.start_doctype_system_identifier(State::DoctypeSystemIdentifierDoubleQuoted)
-                }
-                Some('\'') => {
-                    self.start_doctype_system_identifier(State::DoctypeSystemIdentifierSingleQuoted)
+                Some(c @ ('"' | '\'')) => {
+                    // missing-whitespace-between-doctype-public-and-
+                    // system-identifiers parse error.
+                    self.error(
+                        ParseErrorKind::MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers,
+                        position,
+                    );
+                    let quoted_state = if c == '"' {
+                        State::DoctypeSystemIdentifierDoubleQuoted
+                    } else {
+                        State::DoctypeSystemIdentifierSingleQuoted
+                    };
+                    self.start_doctype_system_identifier(quoted_state)
                 }
                 None => self.eof_in_doctype(out, position),
                 Some(_) => self.bogus_doctype_with_quirks(),
@@ -1549,6 +1737,10 @@ impl Tokenizer {
                     // unexpected-character-after-doctype-system-identifier
                     // parse error — deliberately does *not* set
                     // force_quirks, per spec's explicit note.
+                    self.error(
+                        ParseErrorKind::UnexpectedCharacterAfterDoctypeSystemIdentifier,
+                        position,
+                    );
                     self.state = State::BogusDoctype;
                     true
                 }
@@ -1573,6 +1765,7 @@ impl Tokenizer {
                     // DOCTYPE/comment states' EOF handling, the spec here
                     // says only "emit an end-of-file token" — no
                     // in-progress token exists yet to emit anyway.
+                    self.error(ParseErrorKind::EofInProcessingInstruction, position);
                     push_eof(out, position);
                     false
                 }
@@ -1580,6 +1773,10 @@ impl Tokenizer {
                     // invalid-first-character-of-processing-instruction-
                     // target parse error. Buffer is still empty here —
                     // nothing has been accumulated yet.
+                    self.error(
+                        ParseErrorKind::InvalidFirstCharacterOfProcessingInstructionTarget,
+                        position,
+                    );
                     self.convert_pi_temporary_buffer_to_comment();
                     true
                 }
@@ -1592,6 +1789,10 @@ impl Tokenizer {
                     {
                         // disallowed-processing-instruction-target parse
                         // error.
+                        self.error(
+                            ParseErrorKind::DisallowedProcessingInstructionTarget,
+                            position,
+                        );
                         self.current_comment_data = format!("?{target}");
                         self.state = State::BogusComment;
                     } else {
@@ -1608,11 +1809,14 @@ impl Tokenizer {
                     false
                 }
                 None => {
+                    // eof-in-processing-instruction parse error.
+                    self.error(ParseErrorKind::EofInProcessingInstruction, position);
                     push_eof(out, position);
                     false
                 }
                 Some(_) => {
                     // invalid-processing-instruction-target parse error.
+                    self.error(ParseErrorKind::InvalidProcessingInstructionTarget, position);
                     self.convert_pi_temporary_buffer_to_comment();
                     true
                 }
@@ -1635,9 +1839,10 @@ impl Tokenizer {
                     false
                 }
                 None => {
-                    // eof-in-processing-instruction: the in-progress PI
-                    // token is discarded, not emitted — spec says only
-                    // "emit an end-of-file token" here.
+                    // eof-in-processing-instruction parse error: the
+                    // in-progress PI token is discarded, not emitted —
+                    // spec says only "emit an end-of-file token" here.
+                    self.error(ParseErrorKind::EofInProcessingInstruction, position);
                     self.current_processing_instruction = None;
                     push_eof(out, position);
                     false
@@ -1855,6 +2060,7 @@ impl Tokenizer {
                 }
                 None => {
                     // eof-in-script-html-comment-like-text parse error.
+                    self.error(ParseErrorKind::EofInScriptHtmlCommentLikeText, position);
                     push_eof(out, position);
                     false
                 }
@@ -2094,6 +2300,7 @@ impl Tokenizer {
                 }
                 None => {
                     // eof-in-cdata parse error.
+                    self.error(ParseErrorKind::EofInCdata, position);
                     push_eof(out, position);
                     false
                 }
@@ -2185,6 +2392,8 @@ impl Tokenizer {
                 false
             }
             None => {
+                // eof-in-tag parse error.
+                self.error(ParseErrorKind::EofInTag, position);
                 push_eof(out, position);
                 false
             }
@@ -2506,6 +2715,12 @@ impl Tokenizer {
                     // if !last_matched_is_semicolon: missing-semicolon-
                     // after-character-reference parse error (still
                     // resolved either way, per spec).
+                    if !last_matched_is_semicolon {
+                        self.error(
+                            ParseErrorKind::MissingSemicolonAfterCharacterReference,
+                            self.character_reference_start,
+                        );
+                    }
                     let replacement = Self::lookup_named_character_reference(&matched_name)
                         .expect("matched_name was already verified to be a table entry");
                     let start = self.character_reference_start;
@@ -2530,19 +2745,31 @@ impl Tokenizer {
 
     /// §13.2.5.84 "Numeric character reference end state": resolves
     /// `character_reference_code` to the character it actually represents,
-    /// applying the null/out-of-range/surrogate/control-character
-    /// corrections the spec mandates (each with its own parse error, not
-    /// tracked here — see plan/02-tokenizer.md's parse-error-reporting
-    /// decision).
-    fn resolve_numeric_character_reference_code(&self) -> char {
+    /// applying the null/out-of-range/surrogate/noncharacter/control-
+    /// character corrections the spec mandates — each with its own named
+    /// parse error, reported at `position` (the reference's start,
+    /// matching where the resolved character itself gets flushed).
+    fn resolve_numeric_character_reference_code(&mut self, position: Position) -> char {
         const NUL: u32 = 0x00;
         const MAX_UNICODE: u32 = 0x10FFFF;
         let code = self.character_reference_code;
-        let resolved = if code == NUL || code > MAX_UNICODE || is_surrogate(code) {
+        let resolved = if code == NUL {
+            self.error(ParseErrorKind::NullCharacterReference, position);
+            0xFFFD
+        } else if code > MAX_UNICODE {
+            self.error(
+                ParseErrorKind::CharacterReferenceOutsideUnicodeRange,
+                position,
+            );
+            0xFFFD
+        } else if is_surrogate(code) {
+            self.error(ParseErrorKind::SurrogateCharacterReference, position);
             0xFFFD
         } else if is_noncharacter(code) {
+            self.error(ParseErrorKind::NoncharacterCharacterReference, position);
             code
         } else if code == 0x0D || (is_control(code) && !is_ascii_whitespace(code)) {
+            self.error(ParseErrorKind::ControlCharacterReference, position);
             windows_1252_override(code).unwrap_or(code)
         } else {
             code
@@ -2675,6 +2902,20 @@ mod tests {
             column,
             byte_offset,
         }
+    }
+
+    /// Runs `input` to completion and returns every [`ParseErrorKind`]
+    /// recorded, in encounter order. Phase 07 (`plan/07-parse-errors.md`)
+    /// helper — mirrors [`tokenize`] above but for errors instead of
+    /// tokens.
+    fn errors_for(input: &str) -> Vec<ParseErrorKind> {
+        let mut tokenizer = Tokenizer::new(input);
+        for _ in tokenizer.by_ref() {}
+        tokenizer
+            .take_errors()
+            .into_iter()
+            .map(|error| error.kind)
+            .collect()
     }
 
     #[test]
@@ -3656,5 +3897,129 @@ mod tests {
                 &TokenKind::Eof,
             ]
         );
+    }
+
+    // Phase 07 parse-error tests (`plan/07-parse-errors.md`): one minimal
+    // triggering input per implemented `ParseErrorKind` — not per call
+    // site (several kinds fire from more than one state; one
+    // representative site is enough to confirm the kind itself is wired
+    // correctly). `EofInCdata`/`EofInScriptHtmlCommentLikeText` need
+    // their own setup (foreign content / external state switching) and
+    // get their own tests below the table.
+    #[test]
+    fn tokenizer_level_parse_errors_fire_with_the_right_kind() {
+        let cases: &[(&str, ParseErrorKind)] = &[
+            ("<![CDATA[x]]>", ParseErrorKind::CdataInHtmlContent),
+            ("<!x>", ParseErrorKind::IncorrectlyOpenedComment),
+            ("<!-->", ParseErrorKind::AbruptClosingOfEmptyComment),
+            ("<!--<!--x-->", ParseErrorKind::NestedComment),
+            ("<!--x--!>", ParseErrorKind::IncorrectlyClosedComment),
+            ("<!--", ParseErrorKind::EofInComment),
+            ("<1>", ParseErrorKind::InvalidFirstCharacterOfTagName),
+            ("<", ParseErrorKind::EofBeforeTagName),
+            ("</>", ParseErrorKind::MissingEndTagName),
+            ("<p x=", ParseErrorKind::EofInTag),
+            (r#"<p id="a" id="b">"#, ParseErrorKind::DuplicateAttribute),
+            ("\0", ParseErrorKind::UnexpectedNullCharacter),
+            (
+                r#"<p ">"#,
+                ParseErrorKind::UnexpectedCharacterInAttributeName,
+            ),
+            ("<p x=>", ParseErrorKind::MissingAttributeValue),
+            (
+                r#"<p x=a"b>"#,
+                ParseErrorKind::UnexpectedCharacterInUnquotedAttributeValue,
+            ),
+            (
+                r#"<p x="a"y="b">"#,
+                ParseErrorKind::MissingWhitespaceBetweenAttributes,
+            ),
+            ("<p/ x>", ParseErrorKind::UnexpectedSolidusInTag),
+            (
+                "<p =>",
+                ParseErrorKind::UnexpectedEqualsSignBeforeAttributeName,
+            ),
+            ("&zzz;", ParseErrorKind::UnknownNamedCharacterReference),
+            (
+                "&#;",
+                ParseErrorKind::AbsenceOfDigitsInNumericCharacterReference,
+            ),
+            (
+                "&#65 ",
+                ParseErrorKind::MissingSemicolonAfterCharacterReference,
+            ),
+            ("&#0;", ParseErrorKind::NullCharacterReference),
+            (
+                "&#x110000;",
+                ParseErrorKind::CharacterReferenceOutsideUnicodeRange,
+            ),
+            ("&#xD800;", ParseErrorKind::SurrogateCharacterReference),
+            ("&#xFFFE;", ParseErrorKind::NoncharacterCharacterReference),
+            ("&#x01;", ParseErrorKind::ControlCharacterReference),
+            (
+                "<!DOCTYPEhtml>",
+                ParseErrorKind::MissingWhitespaceBeforeDoctypeName,
+            ),
+            ("<!DOCTYPE >", ParseErrorKind::MissingDoctypeName),
+            (
+                "<!DOCTYPE html foo>",
+                ParseErrorKind::InvalidCharacterSequenceAfterDoctypeName,
+            ),
+            (
+                r#"<!DOCTYPE html PUBLIC "a""b">"#,
+                ParseErrorKind::MissingWhitespaceBetweenDoctypePublicAndSystemIdentifiers,
+            ),
+            (
+                r#"<!DOCTYPE html SYSTEM "a"b>"#,
+                ParseErrorKind::UnexpectedCharacterAfterDoctypeSystemIdentifier,
+            ),
+            ("<!DOCTYPE", ParseErrorKind::EofInDoctype),
+            ("<?", ParseErrorKind::EofInProcessingInstruction),
+            (
+                "<? >",
+                ParseErrorKind::InvalidFirstCharacterOfProcessingInstructionTarget,
+            ),
+            ("<?a$>", ParseErrorKind::InvalidProcessingInstructionTarget),
+            (
+                "<?xml?>",
+                ParseErrorKind::DisallowedProcessingInstructionTarget,
+            ),
+        ];
+        for (input, expected_kind) in cases {
+            let errors = errors_for(input);
+            assert!(
+                errors.contains(expected_kind),
+                "input {input:?}: expected {expected_kind:?} among {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eof_in_cdata_fires_in_foreign_content() {
+        let mut tokenizer = Tokenizer::new("<![CDATA[abc");
+        tokenizer.set_in_foreign_content(true);
+        for _ in tokenizer.by_ref() {}
+        let kinds: Vec<_> = tokenizer
+            .take_errors()
+            .into_iter()
+            .map(|error| error.kind)
+            .collect();
+        assert!(kinds.contains(&ParseErrorKind::EofInCdata));
+    }
+
+    #[test]
+    fn eof_in_script_html_comment_like_text_fires_mid_wrapper() {
+        let mut tokenizer = Tokenizer::new("<script><!--x");
+        while let Some(token) = tokenizer.next() {
+            if matches!(&token.kind, TokenKind::StartTag(_)) {
+                tokenizer.switch_to(ExternalState::ScriptData);
+            }
+        }
+        let kinds: Vec<_> = tokenizer
+            .take_errors()
+            .into_iter()
+            .map(|error| error.kind)
+            .collect();
+        assert!(kinds.contains(&ParseErrorKind::EofInScriptHtmlCommentLikeText));
     }
 }

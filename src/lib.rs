@@ -12,10 +12,21 @@ mod tokenizer;
 mod tree_builder;
 
 pub use document::{Attribute, Children, Document, Node, NodeId, NodeKind};
-pub use tokenizer::Position;
+pub use tokenizer::{ParseError, ParseErrorKind, Position};
 
 use tokenizer::Tokenizer;
 use tree_builder::TreeBuilder;
+
+/// [`parse`]'s return value: the parsed [`Document`] tree plus every
+/// WHATWG "parse error" (§13.2.2) encountered along the way. Both fields
+/// together, not a `Result` — parse errors are never fatal, `document`
+/// is always complete regardless of how many occurred (see
+/// [`ParseError`]'s doc comment).
+#[derive(Debug)]
+pub struct ParseResult {
+    pub document: Document,
+    pub errors: Vec<ParseError>,
+}
 
 /// The driver loop (§13.2 "Parsing HTML documents", the "tokenization and
 /// tree construction" step): parses `input` into a [`Document`] tree with
@@ -32,7 +43,13 @@ use tree_builder::TreeBuilder;
 /// "The end") still runs once, explicitly, right after — its one
 /// tree-shape-relevant step ("pop all the nodes off the stack of open
 /// elements") isn't implied by the loop simply ending.
-pub fn parse(input: &str) -> Document {
+///
+/// Returns [`ParseResult`], not a bare [`Document`], as of Phase 07
+/// (`plan/07-parse-errors.md`) — `errors` currently covers every
+/// tokenizer-level parse error (`src/tokenizer.rs`'s `error()` call
+/// sites); tree-construction-level errors (e.g. stray end tags) are
+/// follow-up work, not yet collected here.
+pub fn parse(input: &str) -> ParseResult {
     let mut tokenizer = Tokenizer::new(input);
     let mut tree_builder = TreeBuilder::new();
     while let Some(token) = tokenizer.next() {
@@ -42,7 +59,10 @@ pub fn parse(input: &str) -> Document {
         tokenizer.set_in_foreign_content(tree_builder.is_in_foreign_content());
     }
     tree_builder.stop_parsing();
-    tree_builder.into_document()
+    ParseResult {
+        document: tree_builder.into_document(),
+        errors: tokenizer.take_errors(),
+    }
 }
 
 #[cfg(test)]
@@ -69,7 +89,8 @@ mod tests {
     fn parses_a_minimal_document_into_the_expected_tree_shape() {
         let document = parse(
             "<!DOCTYPE html><html><head><title>Hi</title></head><body><p>Hello</p></body></html>",
-        );
+        )
+        .document;
 
         let root = document.root();
         let root_children: Vec<_> = document.children(root).collect();
@@ -117,7 +138,7 @@ mod tests {
 
     #[test]
     fn parses_implied_html_head_body_when_missing() {
-        let document = parse("<p>Hello</p>");
+        let document = parse("<p>Hello</p>").document;
 
         let root = document.root();
         assert_eq!(document.children(root).count(), 1);
@@ -135,7 +156,7 @@ mod tests {
 
     #[test]
     fn rcdata_element_content_is_not_parsed_as_markup() {
-        let document = parse("<title><b>not bold</b></title>");
+        let document = parse("<title><b>not bold</b></title>").document;
 
         let root = document.root();
         let html = document.children(root).next().unwrap();
@@ -156,7 +177,7 @@ mod tests {
         // test can reach: Tokenizer::set_in_foreign_content is only
         // ever called from here, based on the *real* TreeBuilder state
         // after processing the <svg> start tag.
-        let document = parse("<svg><![CDATA[hello]]></svg>");
+        let document = parse("<svg><![CDATA[hello]]></svg>").document;
 
         let root = document.root();
         let html = document.children(root).next().unwrap();
@@ -173,7 +194,7 @@ mod tests {
 
     #[test]
     fn cdata_outside_foreign_content_becomes_a_bogus_comment() {
-        let document = parse("<p><![CDATA[hello]]></p>");
+        let document = parse("<p><![CDATA[hello]]></p>").document;
 
         let root = document.root();
         let html = document.children(root).next().unwrap();
@@ -199,7 +220,7 @@ mod tests {
     #[test]
     fn optional_end_tags_produce_sibling_li_elements() {
         // Ported from html-conform's optional_end_tags_produce_sibling_elements.
-        let document = parse("<ul><li>a<li>b</ul>");
+        let document = parse("<ul><li>a<li>b</ul>").document;
         let body = body_of(&document);
         let ul = document.children(body).next().unwrap();
         let items: Vec<_> = document.children(ul).collect();
@@ -222,7 +243,7 @@ mod tests {
     #[test]
     fn svg_element_keeps_svg_namespace_end_to_end() {
         // Ported from html-conform's svg_elements_keep_svg_namespace.
-        let document = parse("<svg><circle/></svg>");
+        let document = parse("<svg><circle/></svg>").document;
         let body = body_of(&document);
         let svg = document.children(body).next().unwrap();
         assert_eq!(
@@ -247,7 +268,7 @@ mod tests {
     #[test]
     fn mathml_element_keeps_mathml_namespace_end_to_end() {
         // Ported from html-conform's mathml_elements_keep_mathml_namespace.
-        let document = parse("<math><mi>x</mi></math>");
+        let document = parse("<math><mi>x</mi></math>").document;
         let body = body_of(&document);
         let math = document.children(body).next().unwrap();
         assert_eq!(
@@ -279,7 +300,7 @@ mod tests {
     #[test]
     fn script_content_is_not_tokenized_as_markup() {
         // Ported from html-conform's script_and_style_content_normalize_to_plain_text.
-        let document = parse("<script>1 < 2;</script>");
+        let document = parse("<script>1 < 2;</script>").document;
         let root = document.root();
         let html = document.children(root).next().unwrap();
         let head = document.children(html).next().unwrap();
@@ -300,7 +321,7 @@ mod tests {
     #[test]
     fn style_content_is_not_tokenized_as_markup() {
         // Ported from html-conform's script_and_style_content_normalize_to_plain_text.
-        let document = parse("<style>a{color:red}</style>");
+        let document = parse("<style>a{color:red}</style>").document;
         let root = document.root();
         let html = document.children(root).next().unwrap();
         let head = document.children(html).next().unwrap();
@@ -321,7 +342,7 @@ mod tests {
     #[test]
     fn named_character_references_resolve_to_decoded_text() {
         // Ported from html-conform's named_entities_resolve_to_decoded_text.
-        let document = parse("<p>&amp; &copy;</p>");
+        let document = parse("<p>&amp; &copy;</p>").document;
         let body = body_of(&document);
         let p = document.children(body).next().unwrap();
         let text = document.children(p).next().unwrap();
@@ -336,7 +357,7 @@ mod tests {
     #[test]
     fn custom_element_gets_html_namespace_like_any_plain_element() {
         // Ported from html-conform's custom_element_gets_xhtml_namespace_like_any_plain_element.
-        let document = parse("<my-widget>hi</my-widget>");
+        let document = parse("<my-widget>hi</my-widget>").document;
         let body = body_of(&document);
         let widget = document.children(body).next().unwrap();
         assert_eq!(
@@ -366,7 +387,7 @@ mod tests {
         // remapping on top of this, a schema-validation-specific
         // concern, not a general parsing fact this crate should assert
         // - this just verifies the parser's own (unremapped) output.
-        let document = parse(r#"<p xml:lang="de">hi</p>"#);
+        let document = parse(r#"<p xml:lang="de">hi</p>"#).document;
         let body = body_of(&document);
         let p = document.children(body).next().unwrap();
         let NodeKind::Element { attributes, .. } = &document.node(p).kind else {
@@ -382,7 +403,7 @@ mod tests {
     fn table_without_tbody_or_tr_gets_them_synthesized() {
         // Spec-derived case (§13.2.6.4.9/.13/.14's implied-tag rules),
         // not covered by html-conform's own test matrix at all.
-        let document = parse("<table><td>x</td></table>");
+        let document = parse("<table><td>x</td></table>").document;
         let body = body_of(&document);
         let table = document.children(body).next().unwrap();
         let tbody = document.children(table).next().unwrap();
@@ -416,7 +437,7 @@ mod tests {
         // tree spelled out in prose: html > head, body > p > [#text:1,
         // b > [#text:2, i > #text:3], i > #text:4, #text:5]. Not
         // covered by html-conform's own test matrix at all.
-        let document = parse("<p>1<b>2<i>3</b>4</i>5</p>");
+        let document = parse("<p>1<b>2<i>3</b>4</i>5</p>").document;
         let body = body_of(&document);
         let p = document.children(body).next().unwrap();
         let p_children: Vec<_> = document.children(p).collect();
@@ -486,7 +507,7 @@ mod tests {
         // would be inside a link to "b", not to "a" [...] The result is
         // that the two a elements are indirectly nested inside each
         // other." Not covered by html-conform's own test matrix.
-        let document = parse(r#"<a href="a">a<table><a href="b">b</table>x"#);
+        let document = parse(r#"<a href="a">a<table><a href="b">b</table>x"#).document;
         let body = body_of(&document);
         let body_children: Vec<_> = document.children(body).collect();
         assert_eq!(body_children.len(), 2);
@@ -542,7 +563,7 @@ mod tests {
         // matrix (which drops DOCTYPE/quirks-mode entirely) - the one
         // place quirks mode actually shapes the produced tree
         // (§13.2.6.4.7's <table> start-tag rule).
-        let no_quirks = parse("<!DOCTYPE html><p><table></table>");
+        let no_quirks = parse("<!DOCTYPE html><p><table></table>").document;
         let body = body_of(&no_quirks);
         let children: Vec<_> = no_quirks.children(body).collect();
         assert_eq!(children.len(), 2);
@@ -556,7 +577,7 @@ mod tests {
         };
         assert_eq!(name, "table");
 
-        let quirks = parse("<p><table></table>"); // no DOCTYPE at all -> quirks mode
+        let quirks = parse("<p><table></table>").document; // no DOCTYPE at all -> quirks mode
         let body = body_of(&quirks);
         let children: Vec<_> = quirks.children(body).collect();
         assert_eq!(children.len(), 1);
@@ -589,7 +610,7 @@ mod tests {
         // directly, not via `TokenOutcome::Reprocess` (which re-checks
         // foreign-content dispatch against the very node whose
         // foreign-namespace-ness never changed, looping forever).
-        let document = parse("<a><svg></a>");
+        let document = parse("<a><svg></a>").document;
         let body = body_of(&document);
         assert_eq!(document.children(body).count(), 1);
     }
@@ -606,7 +627,7 @@ mod tests {
         // the still-`InCell` mode assumes a `td`/`th` remains on the
         // stack, which no longer holds — `close_the_cell` would then
         // pop the now-empty stack forever looking for one.
-        let document = parse("<table><thead><template><td></template></table>");
+        let document = parse("<table><thead><template><td></template></table>").document;
         let body = body_of(&document);
         assert_eq!(document.children(body).count(), 1);
     }
@@ -617,7 +638,7 @@ mod tests {
         // DOCTYPE, with trailing character data "in frameset" mode's
         // "anything else" rule drops entirely (no `<body>` at all in
         // the result — frameset and body are mutually exclusive).
-        let document = parse("<!DOCTYPE html><frameset>test");
+        let document = parse("<!DOCTYPE html><frameset>test").document;
 
         let root = document.root();
         let root_children: Vec<_> = document.children(root).collect();
@@ -651,7 +672,7 @@ mod tests {
         // html5lib-tests' template.dat#0: `<template>`'s real content
         // model (§13.2.6.4.4/.16) — its child is a `DocumentFragment`
         // ("template contents"), not the text directly.
-        let document = parse("<body><template>Hello</template>");
+        let document = parse("<body><template>Hello</template>").document;
         let body = body_of(&document);
 
         let template = document.children(body).next().unwrap();
@@ -682,7 +703,7 @@ mod tests {
         // it's the last token in the input — only `stop_parsing`'s
         // final pop of the still-open `<option>` makes that observable.
         let document =
-            parse("<select><button><selectedcontent></button><option>X<option selected>Y");
+            parse("<select><button><selectedcontent></button><option>X<option selected>Y").document;
         let body = body_of(&document);
 
         let select = document.children(body).next().unwrap();

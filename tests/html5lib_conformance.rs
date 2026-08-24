@@ -145,7 +145,7 @@ fn html5lib_tree_construction_conformance() {
                 continue;
             }
 
-            let document = html5_parser::parse(&case.data);
+            let document = html5_parser::parse(&case.data).document;
             let actual = dump_document(&document);
 
             if actual == case.expected_document {
