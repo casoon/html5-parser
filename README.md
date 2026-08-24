@@ -1,85 +1,72 @@
 # html5-parser
 
-A pure-Rust WHATWG HTML5 tokenizer and tree-construction implementation.
+[![crates.io](https://img.shields.io/crates/v/html5-parser.svg)](https://crates.io/crates/html5-parser)
+[![docs.rs](https://img.shields.io/docsrs/html5-parser)](https://docs.rs/html5-parser)
 
-## Scope
+A pure-Rust [WHATWG HTML5](https://html.spec.whatwg.org/multipage/parsing.html)
+parser: tokenizer + full tree construction, transcribed directly from the
+spec rather than ported from another implementation.
 
-Deliberately staged, not built as a fully generic library from day one:
+- **Spec-derived, not guessed.** Every state and algorithm is transcribed
+  from the raw WHATWG HTML parsing specification text — adoption agency,
+  foster parenting, foreign content (SVG/MathML), frameset, `<template>`'s
+  real content-fragment model, all included.
+- **100% conformant** against the
+  [html5lib-tests](https://github.com/html5lib/html5lib-tests)
+  tree-construction corpus — 1,726/1,726 applicable cases pass (see
+  [Testing](#testing) below).
+- **Per-node source positions.** Every node in the resulting tree carries
+  its line/column/byte offset in the original input, not just the parsed
+  structure — useful for anything that needs to point back at source
+  (linters, validators, diagnostics).
+- **No dependencies, no `unsafe`.**
 
-1. **Step 1:** only what [`html-conform`](https://github.com/casoon/html-conform)
-   (a sibling project) actually needs to replace its current HTML5
-   parsing dependency — a tokenizer and tree-construction implementation
-   whose output can directly feed `html-conform`'s
-   `src/infoset.rs::normalize()`, including per-node source positions (its
-   current dependency has none). No generic public API commitment yet.
-2. **Step 2:** once step 1 is proven against `html-conform`'s real usage,
-   extract the generic, `html-conform`-agnostic part (a reusable WHATWG
-   HTML5 tokenizer/tree-builder) as this crate's public API.
+## Usage
 
-## Architecture (working title)
+```rust
+use html5_parser::{parse, Document, NodeId, NodeKind};
 
+fn main() {
+    let document = parse("<!DOCTYPE html><title>Hi</title><h1>Hello, world!</h1>");
+    print_tree(&document, document.root(), 0);
+}
+
+fn print_tree(document: &Document, node: NodeId, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match &document.node(node).kind {
+        NodeKind::Element { name, .. } => println!("{indent}<{name}>"),
+        NodeKind::Text { content } => println!("{indent}{content:?}"),
+        _ => {}
+    }
+    for child in document.children(node) {
+        print_tree(document, child, depth + 1);
+    }
+}
 ```
-HTML input (string) → tokenizer (WHATWG tokenizer state machine)
-                     → tree_builder (WHATWG tree-construction algorithm,
-                       incl. foreign content / SVG / MathML)
-                     → document (element/text/comment tree with positions)
-```
 
-## Normative basis
+`Document`'s read-only API (`root`/`node`/`parent`/`children`) is
+intentionally minimal — just enough to walk the tree and read each
+node's kind and source position. See [docs.rs](https://docs.rs/html5-parser)
+for the full API.
 
-Implementation decisions are derived from the
-[WHATWG HTML parsing specification](https://html.spec.whatwg.org/multipage/parsing.html).
-Other implementations (e.g. `html5ever`) are explanatory references only,
-not a source to copy code from.
+## Known limitations
 
-## Status
+Two narrow, deliberately out-of-scope sub-features, neither exercised by
+the html5lib-tests corpus:
 
-The tokenizer (§13.2.5) and tree-construction algorithm (§13.2.6 — all
-insertion modes, adoption agency, foster parenting, foreign content) are
-implemented and wired end to end.
-
-`pub fn parse(input: &str) -> Document` and the read-only tree types
-(`Document`, `NodeId`, `NodeKind`, `Node`, `Attribute`, `Position`,
-`Children`) are public — just enough to walk the resulting tree and read
-each node's kind and source position, matching what `html-conform`'s
-`src/infoset.rs::normalize()` needs. `Tokenizer`/`TreeBuilder` and
-everything else stay crate-internal (see Scope above — no commitment to
-a generic public API yet, that's Step 2). Published on crates.io as
-[`html5-parser`](https://crates.io/crates/html5-parser).
-
-### Known limitations
-
-Three gaps were tracked here, evidence-based (per Step 1's scope, above)
-rather than oversights, closed out one by one ahead of the first
-`crates.io` publish (see `plan/DECISIONS.md`), independently of whether
-`html-conform` itself ends up needing each one — **all three are now
-done**:
-
-- ~~Frameset-related insertion modes not implemented~~ — **done**:
-  "in frameset"/"after frameset"/"after after frameset" (§13.2.6.4.18-21)
-  are implemented, including `<frameset>` correctly replacing (rather
-  than nesting under) `<body>` per §13.2.6.4.7/.4.6's real rules. See
-  `plan/04-frameset.md`.
-- ~~`<template>` treated as an ordinary element~~ — **done** (the
-  classic content model): `<template>` gets a real, separate
-  `NodeKind::DocumentFragment` "template contents" (§13.2.6.4.4/.16,
-  the stack of template insertion modes, the active-formatting-elements
-  marker). **Still not implemented within this**: two much newer,
-  still-evolving sub-features layered onto `<template>` in the current
-  spec, neither exercised by the html5lib-tests corpus: declarative
-  shadow DOM (`shadowrootmode` and friends) and content patching (the
-  `for` attribute) — both would require modeling shadow roots/custom
-  element registries this crate has no other use for. See
-  `plan/05-template.md`.
-- ~~`<selectedcontent>` treated as an ordinary element~~ — **done**,
-  with a scope note: this isn't actually a tree-construction (§13.2.6)
-  feature at all — it's the `<option>` element's own HTML-parser-specific
-  hook (form-elements.html §4.10.10/.17, "maybe clone an option into
-  selectedcontent", run when an `option` is popped off the stack of open
-  elements), simplified to this crate's parse-time-only, non-scripted
-  needs (no live selectedness mutation, no `multiple` `<select>`
-  support, a practically- rather than fully-generally-scoped "list of
-  options"/`disabled`-flag walk). See `plan/06-selectedcontent.md`.
+- **`<template>`**'s classic content-fragment model (a real, inert
+  `NodeKind::DocumentFragment` per template element) is implemented, but
+  two much newer, still-evolving sub-features layered onto `<template>`
+  in the current spec are not: declarative shadow DOM (`shadowrootmode`
+  and friends) and content patching (the `for` attribute) — both would
+  require modeling shadow roots/custom element registries this crate has
+  no other use for.
+- **`<selectedcontent>`**'s option-mirroring (the "customizable
+  `<select>`" proposal) is implemented for ordinary, non-scripted
+  parse-time use, but simplifies a few edge cases: no `multiple`
+  `<select>` support, and a practically- rather than fully-generally-
+  scoped "list of options" walk (doesn't handle every possible
+  `<optgroup>` nesting shape).
 
 ## Testing
 
@@ -94,6 +81,34 @@ tree-construction corpus — currently all 1,726 applicable cases pass
 rather than deleted, as the harness's regression-tracking mechanism —
 see that file's header — for whenever a future corpus refresh or code
 change introduces a real one).
+
+## Normative basis
+
+Implementation decisions are derived from the
+[WHATWG HTML parsing specification](https://html.spec.whatwg.org/multipage/parsing.html).
+Other implementations (e.g. `html5ever`) are explanatory references only,
+not a source to copy code from.
+
+## Architecture (working title)
+
+```
+HTML input (string) → tokenizer (WHATWG tokenizer state machine)
+                     → tree_builder (WHATWG tree-construction algorithm,
+                       incl. foreign content / SVG / MathML)
+                     → document (element/text/comment tree with positions)
+```
+
+## Origin
+
+This crate started as a staged, sibling-project effort: build only what
+[`html-conform`](https://github.com/casoon/html-conform) needed to
+replace its previous HTML5-parsing dependency, prove that against real
+usage, and only then decide on a public API and whether to publish
+standalone. In practice, full spec coverage and a first `crates.io`
+publish happened ahead of that cross-repo validation step, on direct
+request — see `plan/DECISIONS.md` for the decision log and `plan/`
+generally for the phase-by-phase implementation history (not tracked in
+git, see `CLAUDE.md`).
 
 ## License
 
