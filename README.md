@@ -65,6 +65,19 @@ that can contain `<frameset>`, or gains real `<template>`-content test
 cases), these decisions should be revisited explicitly rather than
 half-implemented silently.
 
+## Testing
+
+Besides hand-written unit/end-to-end tests (`src/tokenizer.rs`,
+`src/tree_builder.rs`, `src/lib.rs`), `cargo test` also runs
+`tests/html5lib_conformance.rs`: every applicable case (full-document,
+non-fragment, non-scripting — see `tests/html5lib-tests/README.md`) from
+the vendored [html5lib-tests](https://github.com/html5lib/html5lib-tests)
+tree-construction corpus — currently 1,726 applicable cases, 1,544
+passing (89%). Known failures (entirely the two "Known limitations"
+above — frameset and `<template>` content) are tracked explicitly in
+`tests/html5lib_known_failures.txt` rather than silently ignored; see
+that file's header for how to regenerate it.
+
 ## License
 
 MIT — see `LICENSE`.

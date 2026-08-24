@@ -2390,36 +2390,53 @@ impl TreeBuilder {
             let outcome = if self.should_process_as_foreign_content(kind) {
                 self.process_token_foreign_content(kind, position)
             } else {
-                match self.insertion_mode {
-                    InsertionMode::Initial => self.process_token_initial(kind, position),
-                    InsertionMode::BeforeHtml => self.process_token_before_html(kind, position),
-                    InsertionMode::BeforeHead => self.process_token_before_head(kind, position),
-                    InsertionMode::InHead => self.process_token_in_head(kind, position),
-                    InsertionMode::InHeadNoscript => {
-                        self.process_token_in_head_noscript(kind, position)
-                    }
-                    InsertionMode::AfterHead => self.process_token_after_head(kind, position),
-                    InsertionMode::InBody => self.process_token_in_body(kind, position),
-                    InsertionMode::Text => self.process_token_text(kind, position),
-                    InsertionMode::InTable => self.process_token_in_table(kind, position),
-                    InsertionMode::InTableText => self.process_token_in_table_text(kind, position),
-                    InsertionMode::InCaption => self.process_token_in_caption(kind, position),
-                    InsertionMode::InColumnGroup => {
-                        self.process_token_in_column_group(kind, position)
-                    }
-                    InsertionMode::InTableBody => self.process_token_in_table_body(kind, position),
-                    InsertionMode::InRow => self.process_token_in_row(kind, position),
-                    InsertionMode::InCell => self.process_token_in_cell(kind, position),
-                    InsertionMode::AfterBody => self.process_token_after_body(kind, position),
-                    InsertionMode::AfterAfterBody => {
-                        self.process_token_after_after_body(kind, position)
-                    }
-                }
+                self.process_token_by_insertion_mode(kind, position)
             };
             match outcome {
                 TokenOutcome::Consumed(state) => return state,
                 TokenOutcome::Reprocess => continue,
             }
+        }
+    }
+
+    /// Dispatches to the handler for the current insertion mode — "process
+    /// the token according to the rules given in the section corresponding
+    /// to the current insertion mode in HTML content" (§13.2.6.5's "any
+    /// other end tag" rule quotes this exact phrase). Factored out of
+    /// [`process_token`](Self::process_token) so that rule can call it
+    /// directly instead of returning `TokenOutcome::Reprocess`: a
+    /// `Reprocess` result sends the token back through
+    /// [`should_process_as_foreign_content`](Self::should_process_as_foreign_content),
+    /// which for that rule specifically re-examines the very node
+    /// (adjusted current node) whose foreign-namespace-ness triggered
+    /// foreign-content dispatch in the first place — since that rule
+    /// doesn't itself pop or otherwise change the current node before
+    /// deferring to HTML content, nothing about that re-check would ever
+    /// come out different, so `Reprocess` would loop forever instead of
+    /// making progress.
+    fn process_token_by_insertion_mode(
+        &mut self,
+        kind: &TokenKind,
+        position: Position,
+    ) -> TokenOutcome {
+        match self.insertion_mode {
+            InsertionMode::Initial => self.process_token_initial(kind, position),
+            InsertionMode::BeforeHtml => self.process_token_before_html(kind, position),
+            InsertionMode::BeforeHead => self.process_token_before_head(kind, position),
+            InsertionMode::InHead => self.process_token_in_head(kind, position),
+            InsertionMode::InHeadNoscript => self.process_token_in_head_noscript(kind, position),
+            InsertionMode::AfterHead => self.process_token_after_head(kind, position),
+            InsertionMode::InBody => self.process_token_in_body(kind, position),
+            InsertionMode::Text => self.process_token_text(kind, position),
+            InsertionMode::InTable => self.process_token_in_table(kind, position),
+            InsertionMode::InTableText => self.process_token_in_table_text(kind, position),
+            InsertionMode::InCaption => self.process_token_in_caption(kind, position),
+            InsertionMode::InColumnGroup => self.process_token_in_column_group(kind, position),
+            InsertionMode::InTableBody => self.process_token_in_table_body(kind, position),
+            InsertionMode::InRow => self.process_token_in_row(kind, position),
+            InsertionMode::InCell => self.process_token_in_cell(kind, position),
+            InsertionMode::AfterBody => self.process_token_after_body(kind, position),
+            InsertionMode::AfterAfterBody => self.process_token_after_after_body(kind, position),
         }
     }
 
@@ -2643,7 +2660,15 @@ impl TreeBuilder {
                         .element_immediately_above(current)
                         .expect("current is not topmost, so an element always sits above it");
                     if self.is_html_namespace_element(next) {
-                        return TokenOutcome::Reprocess;
+                        // Step 7: process the token per the current
+                        // insertion mode's HTML content rules — a direct
+                        // call, not `TokenOutcome::Reprocess` (which
+                        // would just re-run `should_process_as_foreign_content`
+                        // against the still-unchanged, still-foreign
+                        // current node and dispatch back here forever;
+                        // see `process_token_by_insertion_mode`'s doc
+                        // comment).
+                        return self.process_token_by_insertion_mode(kind, position);
                     }
                     node = Some(next);
                 }
@@ -3211,6 +3236,21 @@ impl TreeBuilder {
                     self.open_elements
                         .generate_implied_end_tags_thoroughly(&self.document);
                     self.pop_until_one_of_popped(&["template"]);
+                    // Real §13.2.6.4.4 also pops the "stack of template
+                    // insertion modes" here, which this crate's
+                    // simplification never pushes to (see this
+                    // function's doc comment) — so `self.insertion_mode`
+                    // is left exactly as it was for whatever token came
+                    // *after* `<template>` was opened (e.g. `InCell`,
+                    // if a `<td>` was implicitly opened inside it). With
+                    // `<template>`'s subtree now popped off the stack,
+                    // that mode can describe an invariant the current
+                    // node no longer satisfies (e.g. `InCell` with no
+                    // td/th left on the stack), which several modes'
+                    // handlers assume never happens — recompute it from
+                    // the actual current node instead of leaving it
+                    // stale.
+                    self.reset_the_insertion_mode_appropriately();
                 }
                 TokenOutcome::Consumed(None)
             }

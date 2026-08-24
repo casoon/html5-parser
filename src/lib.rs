@@ -568,4 +568,43 @@ mod tests {
         };
         assert_eq!(name, "table");
     }
+
+    // The next two tests pin the minimal reproductions of two infinite
+    // loops the html5lib-tests conformance corpus (tests/html5lib_conformance.rs)
+    // surfaced — both fixed in `tree_builder.rs`. Neither asserts much
+    // about the resulting tree shape; the property under test is that
+    // `parse` returns at all (a regression would hang this test rather
+    // than fail it cleanly, same as it hung `cargo test` before the fix).
+
+    #[test]
+    fn end_tag_that_walks_out_of_foreign_content_does_not_loop_forever() {
+        // `</a>` while the current node is `<svg>` (no HTML-special
+        // element between them) sends foreign content's "any other end
+        // tag" rule (§13.2.6.5) all the way up to the first HTML-namespace
+        // ancestor without ever popping anything itself — it must then
+        // hand off to that insertion mode's own HTML-content rules
+        // directly, not via `TokenOutcome::Reprocess` (which re-checks
+        // foreign-content dispatch against the very node whose
+        // foreign-namespace-ness never changed, looping forever).
+        let document = parse("<a><svg></a>");
+        let body = body_of(&document);
+        assert_eq!(document.children(body).count(), 1);
+    }
+
+    #[test]
+    fn template_end_tag_resets_a_stale_insertion_mode() {
+        // `<template>` inside `<thead>` implicitly opens a `<tr><td>`
+        // (this crate treats `<template>` as a plain element — no
+        // template insertion-modes stack, see README.md's "Known
+        // limitations" — so the insertion mode active for that implicit
+        // `<td>`, `InCell`, is never restored). `</template>` then pops
+        // `<td>`/`<tr>`/`<template>` off the stack without resetting the
+        // insertion mode; the next token (`</table>`) processed under
+        // the still-`InCell` mode assumes a `td`/`th` remains on the
+        // stack, which no longer holds — `close_the_cell` would then
+        // pop the now-empty stack forever looking for one.
+        let document = parse("<table><thead><template><td></template></table>");
+        let body = body_of(&document);
+        assert_eq!(document.children(body).count(), 1);
+    }
 }
