@@ -1434,6 +1434,7 @@ pub(crate) enum InsertionMode {
     InTableBody,
     InRow,
     InCell,
+    InTemplate,
     AfterBody,
     InFrameset,
     AfterFrameset,
@@ -1535,11 +1536,9 @@ pub(crate) struct TreeBuilder {
     form_element_pointer: Option<NodeId>,
     /// The "frameset-ok flag" (§13.2.4.1). Defaults to "ok" (`true`);
     /// most of "in body"'s content-inserting rules set it to "not ok".
-    /// Nothing reads it yet — this crate doesn't implement the
-    /// `<frameset>`/"in frameset" path at all (see the scope decision
-    /// in plan/03-tree-construction.md) — but it's tracked faithfully
-    /// regardless, the same stance taken for other pieces of state built
-    /// ahead of their first real consumer.
+    /// Read by "in body"'s `<frameset>` start-tag rule (§13.2.6.4.7,
+    /// plan/04-frameset.md) to decide whether a misplaced `<frameset>`
+    /// may still replace `<body>`.
     frameset_ok: bool,
     /// Sentinel for "if the next token is a U+000A LINE FEED (LF)
     /// character token, then ignore that token" (§13.2.6.4.7's `pre`/
@@ -1557,6 +1556,15 @@ pub(crate) struct TreeBuilder {
     /// original position, matching how the tokenizer would have
     /// produced these as separate character tokens.
     pending_table_character_tokens: Vec<(char, Position)>,
+    /// The "stack of template insertion modes" (§13.2.4.1) — the "current
+    /// template insertion mode" is its last entry. Pushed to by `<template>`
+    /// start tags (§13.2.6.4.4) and "in template" mode's own rules
+    /// (§13.2.6.4.16), popped by `</template>` end tags and "in
+    /// template"'s EOF rule. Consulted by "in body"'s EOF rule (whether
+    /// to defer to "in template" instead) and by
+    /// `reset_the_insertion_mode_appropriately` (a `template` current
+    /// node switches to this stack's top, not a fixed mode).
+    stack_of_template_insertion_modes: Vec<InsertionMode>,
 }
 
 impl TreeBuilder {
@@ -1574,6 +1582,7 @@ impl TreeBuilder {
             frameset_ok: true,
             skip_next_line_feed: false,
             pending_table_character_tokens: Vec::new(),
+            stack_of_template_insertion_modes: Vec::new(),
         }
     }
 
@@ -1589,12 +1598,35 @@ impl TreeBuilder {
                 .expect("inserting a node requires a current node on the stack")
         });
 
-        if self.foster_parenting && self.is_foster_parenting_target(target) {
-            return self.foster_parenting_location();
-        }
+        let location = if self.foster_parenting && self.is_foster_parenting_target(target) {
+            self.foster_parenting_location()
+        } else {
+            InsertionLocation {
+                parent: target,
+                before: None,
+            }
+        };
 
+        self.redirect_into_template_contents(location)
+    }
+
+    /// §13.2.6.1's final step: "If [the] adjusted insertion location is
+    /// inside a `template` element" — redirect into that element's
+    /// template contents instead, applied uniformly after either of the
+    /// two branches above (including foster parenting's own "there is a
+    /// last template" case, which lands on the template element itself
+    /// the same way the plain, non-foster-parenting path can). This
+    /// crate has no "insertion target" (part of the `for`-attribute
+    /// content-patching feature — out of scope, see README's Known
+    /// limitations), so the spec's own `target is not null` branch never
+    /// applies: always "inside the template's contents, after its last
+    /// child".
+    fn redirect_into_template_contents(&self, location: InsertionLocation) -> InsertionLocation {
+        if !self.node_has_html_name(location.parent, "template") {
+            return location;
+        }
         InsertionLocation {
-            parent: target,
+            parent: self.template_contents(location.parent),
             before: None,
         }
     }
@@ -1628,10 +1660,10 @@ impl TreeBuilder {
                 Some(last_table) => self.open_elements.is_lower(last_template, last_table),
             };
             if use_template {
-                // Simplified: <template> has no separate "template
-                // contents" fragment in this crate's scope (see
-                // plan/03-tree-construction.md) — insert directly inside
-                // the template element itself.
+                // Targets the template *element* itself here — the
+                // caller (`appropriate_place_for_inserting_a_node`)
+                // redirects into its template contents afterward, the
+                // same generic step it applies to every other branch.
                 return InsertionLocation {
                     parent: last_template,
                     before: None,
@@ -1703,13 +1735,34 @@ impl TreeBuilder {
         } else {
             adjust_attributes_for_foreign_element(tag, namespace)
         };
-        self.document.new_node(
+        let element = self.document.new_node(
             NodeKind::Element {
                 name: tag.name.clone(),
                 namespace: Some(namespace.to_owned()),
                 attributes,
             },
             position,
+        );
+        if namespace == HTML_NAMESPACE && tag.name == "template" {
+            // Every `template` element gets its "template contents"
+            // fragment created alongside it (not deferred to whichever
+            // insertion-mode rule happens to insert content into it) —
+            // see `NodeKind::DocumentFragment`'s doc comment and
+            // `appropriate_place_for_inserting_a_node`'s redirect step,
+            // which is what actually routes real children here.
+            let content = self.document.new_node(NodeKind::DocumentFragment, None);
+            self.document.append_child(element, content);
+        }
+        element
+    }
+
+    /// The `template` element's "template contents" fragment — its sole
+    /// real tree child, created alongside it in
+    /// [`create_element_for_token`](Self::create_element_for_token).
+    fn template_contents(&self, template: NodeId) -> NodeId {
+        self.document.children(template).next().expect(
+            "a template element always has its template-contents fragment as its first (and \
+             only, until real content is inserted into it) tree child",
         )
     }
 
@@ -2438,6 +2491,7 @@ impl TreeBuilder {
             InsertionMode::InTableBody => self.process_token_in_table_body(kind, position),
             InsertionMode::InRow => self.process_token_in_row(kind, position),
             InsertionMode::InCell => self.process_token_in_cell(kind, position),
+            InsertionMode::InTemplate => self.process_token_in_template(kind, position),
             InsertionMode::AfterBody => self.process_token_after_body(kind, position),
             InsertionMode::InFrameset => self.process_token_in_frameset(kind, position),
             InsertionMode::AfterFrameset => self.process_token_after_frameset(kind, position),
@@ -3126,6 +3180,13 @@ impl TreeBuilder {
                 self.insertion_mode = InsertionMode::InTable;
                 return;
             }
+            if self.node_has_html_name(current, "template") {
+                self.insertion_mode = *self
+                    .stack_of_template_insertion_modes
+                    .last()
+                    .expect("a template element on the stack always has a matching entry here");
+                return;
+            }
             if !last && self.node_has_html_name(current, "head") {
                 self.insertion_mode = InsertionMode::InHead;
                 return;
@@ -3162,21 +3223,20 @@ impl TreeBuilder {
         }
     }
 
-    /// The "in head" insertion mode (§13.2.6.4.4). `<template>` is
-    /// deliberately simplified per this crate's scope decision
-    /// (plan/03-tree-construction.md): treated as an ordinary element,
-    /// not a separate inert content fragment — no active-formatting-
-    /// elements marker on open, no template insertion modes stack, no
-    /// shadow-root handling. Its end tag still pops through to the
-    /// nearest open `template`, generating implied end tags thoroughly
-    /// first, but skips clearing the active formatting elements list
-    /// (that clear is tied to the marker this simplification never
-    /// pushes — clearing without it would wipe out unrelated formatting
-    /// state from an enclosing context). Character-encoding sniffing
-    /// (`<meta charset>`) and script-execution bookkeeping (parser
-    /// document, force-async, already-started, `document.write()`
-    /// re-entrancy) are entirely out of scope — this crate never
-    /// decodes bytes itself or executes scripts.
+    /// The "in head" insertion mode (§13.2.6.4.4). `<template>`'s
+    /// classic content-fragment model is implemented (marker on the
+    /// active formatting elements list, the stack of template insertion
+    /// modes, `NodeKind::DocumentFragment` template contents — see
+    /// plan/04-frameset.md's "Normative Grundlage" for where this was
+    /// researched and plan/05-template.md for this piece specifically);
+    /// declarative shadow DOM (`shadowrootmode`) and content patching
+    /// (`for`) are not — see README's Known limitations, both require
+    /// modeling shadow roots/custom element registries this crate has
+    /// no other use for. Character-encoding sniffing (`<meta charset>`)
+    /// and script-execution bookkeeping (parser document, force-async,
+    /// already-started, `document.write()` re-entrancy) are entirely
+    /// out of scope — this crate never decodes bytes itself or executes
+    /// scripts.
     fn process_token_in_head(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
         match kind {
             TokenKind::Character(c) if is_whitespace(*c) => {
@@ -3248,30 +3308,35 @@ impl TreeBuilder {
                 self.in_head_anything_else()
             }
             TokenKind::StartTag(tag) if tag.name == "template" => {
+                self.active_formatting_elements.push_marker();
+                self.frameset_ok = false;
+                self.insertion_mode = InsertionMode::InTemplate;
+                self.stack_of_template_insertion_modes
+                    .push(InsertionMode::InTemplate);
+                // The `shadowrootmode`/`for`-attribute branches
+                // (declarative shadow DOM, content-patching — out of
+                // scope, see this function's doc comment) never apply:
+                // always the "otherwise, insert an HTML element" path.
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "template" => {
-                if self.has_template_on_stack() {
-                    self.open_elements
-                        .generate_implied_end_tags_thoroughly(&self.document);
-                    self.pop_until_one_of_popped(&["template"]);
-                    // Real §13.2.6.4.4 also pops the "stack of template
-                    // insertion modes" here, which this crate's
-                    // simplification never pushes to (see this
-                    // function's doc comment) — so `self.insertion_mode`
-                    // is left exactly as it was for whatever token came
-                    // *after* `<template>` was opened (e.g. `InCell`,
-                    // if a `<td>` was implicitly opened inside it). With
-                    // `<template>`'s subtree now popped off the stack,
-                    // that mode can describe an invariant the current
-                    // node no longer satisfies (e.g. `InCell` with no
-                    // td/th left on the stack), which several modes'
-                    // handlers assume never happens — recompute it from
-                    // the actual current node instead of leaving it
-                    // stale.
-                    self.reset_the_insertion_mode_appropriately();
+                if !self.has_template_on_stack() {
+                    // Parse error, ignore the token.
+                    return TokenOutcome::Consumed(None);
                 }
+                self.open_elements
+                    .generate_implied_end_tags_thoroughly(&self.document);
+                // The parse-error check ("current node is not a
+                // template element") has no tree-shape effect. The
+                // "insertion target"/marker cleanup is content-
+                // patching's `for`-attribute bookkeeping — out of
+                // scope, this crate never sets those in the first
+                // place.
+                self.pop_until_one_of_popped(&["template"]);
+                self.active_formatting_elements.clear_up_to_last_marker();
+                self.stack_of_template_insertion_modes.pop();
+                self.reset_the_insertion_mode_appropriately();
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "head" => TokenOutcome::Consumed(None),
@@ -3560,12 +3625,12 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::Eof => {
-                // The "stack of template insertion modes" branch never
-                // applies (no such stack — <template> is a plain
-                // element, see plan/03-tree-construction.md's scope
-                // decision, still in force). The parse-error check has
-                // no tree-shape effect. "Stop parsing" itself is a
-                // driver-loop concern, not yet built.
+                if !self.stack_of_template_insertion_modes.is_empty() {
+                    return self.process_token_in_template(kind, position);
+                }
+                // The parse-error check has no tree-shape effect. "Stop
+                // parsing" itself is a driver-loop concern, not yet
+                // built.
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "body" => {
@@ -4858,6 +4923,81 @@ impl TreeBuilder {
         }
     }
 
+    /// Pops and re-pushes the current template insertion mode as `mode`,
+    /// switches the insertion mode to it, and reprocesses — the shared
+    /// shape of "in template"'s (§13.2.6.4.16) several
+    /// "pop/push/switch/reprocess" arms.
+    fn switch_from_in_template_to(&mut self, mode: InsertionMode) -> TokenOutcome {
+        self.stack_of_template_insertion_modes.pop();
+        self.stack_of_template_insertion_modes.push(mode);
+        self.insertion_mode = mode;
+        TokenOutcome::Reprocess
+    }
+
+    /// The "in template" insertion mode (§13.2.6.4.16).
+    fn process_token_in_template(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
+        match kind {
+            TokenKind::Character(_)
+            | TokenKind::Comment(_)
+            | TokenKind::ProcessingInstruction(_)
+            | TokenKind::Doctype(_) => self.process_token_in_body(kind, position),
+            TokenKind::StartTag(tag)
+                if matches!(
+                    tag.name.as_str(),
+                    "base"
+                        | "basefont"
+                        | "bgsound"
+                        | "link"
+                        | "meta"
+                        | "noframes"
+                        | "script"
+                        | "style"
+                        | "template"
+                        | "title"
+                ) =>
+            {
+                self.process_token_in_head(kind, position)
+            }
+            TokenKind::EndTag(tag) if tag.name == "template" => {
+                self.process_token_in_head(kind, position)
+            }
+            TokenKind::StartTag(tag)
+                if matches!(
+                    tag.name.as_str(),
+                    "caption" | "colgroup" | "tbody" | "tfoot" | "thead"
+                ) =>
+            {
+                self.switch_from_in_template_to(InsertionMode::InTable)
+            }
+            TokenKind::StartTag(tag) if tag.name == "col" => {
+                self.switch_from_in_template_to(InsertionMode::InColumnGroup)
+            }
+            TokenKind::StartTag(tag) if tag.name == "tr" => {
+                self.switch_from_in_template_to(InsertionMode::InTableBody)
+            }
+            TokenKind::StartTag(tag) if matches!(tag.name.as_str(), "td" | "th") => {
+                self.switch_from_in_template_to(InsertionMode::InRow)
+            }
+            TokenKind::StartTag(_) => self.switch_from_in_template_to(InsertionMode::InBody),
+            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::Eof => {
+                // "If there is no template element on the stack of open
+                // elements, stop parsing" is the fragment case (never
+                // reached: this crate never does fragment parsing, and
+                // this mode is only ever entered via a genuine
+                // `<template>` start tag, which always pushes a
+                // template element first). The "otherwise this is a
+                // parse error" check on the real path has no
+                // tree-shape effect.
+                self.pop_until_one_of_popped(&["template"]);
+                self.active_formatting_elements.clear_up_to_last_marker();
+                self.stack_of_template_insertion_modes.pop();
+                self.reset_the_insertion_mode_appropriately();
+                TokenOutcome::Reprocess
+            }
+        }
+    }
+
     /// The "after body" insertion mode (§13.2.6.4.17).
     fn process_token_after_body(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
         match kind {
@@ -6011,7 +6151,7 @@ mod adoption_agency_tests {
 
 #[cfg(test)]
 mod insertion_mode_tests {
-    use super::{InsertionMode, QuirksMode, TreeBuilder};
+    use super::{FormattingEntry, InsertionMode, QuirksMode, TreeBuilder};
     use crate::document::{NodeId, NodeKind};
     use crate::tokenizer::{Attribute, DoctypeToken, ExternalState, Position, TagToken, TokenKind};
 
@@ -6355,6 +6495,120 @@ mod insertion_mode_tests {
             builder.document.children(head).collect::<Vec<_>>(),
             vec![template]
         );
+    }
+
+    #[test]
+    fn in_head_template_start_tag_pushes_marker_and_switches_to_in_template() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_head(&mut builder);
+        builder.frameset_ok = true;
+
+        builder.process_token(&start_tag("template"), pos());
+
+        let template = builder.open_elements.current_node().unwrap();
+        assert!(matches!(
+            builder.active_formatting_elements.entries.last(),
+            Some(FormattingEntry::Marker)
+        ));
+        assert!(!builder.frameset_ok);
+        assert_eq!(builder.insertion_mode, InsertionMode::InTemplate);
+        assert_eq!(
+            builder.stack_of_template_insertion_modes,
+            vec![InsertionMode::InTemplate]
+        );
+        // The template's own child is its content fragment, not
+        // whatever gets inserted "inside" it afterward.
+        let content: Vec<_> = builder.document.children(template).collect();
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            builder.document.node(content[0]).kind,
+            NodeKind::DocumentFragment
+        );
+    }
+
+    #[test]
+    fn in_head_template_end_tag_resets_insertion_mode_via_the_stack() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_head(&mut builder);
+
+        builder.process_token(&start_tag("template"), pos());
+        builder.process_token(&end_tag("template"), pos());
+
+        assert!(builder.stack_of_template_insertion_modes.is_empty());
+        // `reset_the_insertion_mode_appropriately` recomputes from the
+        // actual current node (`head`) rather than leaving `InTemplate`
+        // stale — same reasoning as the `</template>` fix in
+        // `process_token_in_head`'s sibling arm above.
+        assert_eq!(builder.insertion_mode, InsertionMode::InHead);
+    }
+
+    #[test]
+    fn content_inserted_under_a_template_lands_in_its_content_fragment() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_head(&mut builder);
+        builder.process_token(&start_tag("template"), pos());
+        let template = builder.open_elements.current_node().unwrap();
+        let content = builder.document.children(template).next().unwrap();
+
+        // "In template" mode's "any other start tag" arm: pop/push/switch
+        // to "in body", reprocess.
+        builder.process_token(&start_tag("p"), pos());
+
+        assert_eq!(builder.insertion_mode, InsertionMode::InBody);
+        assert_eq!(
+            builder.stack_of_template_insertion_modes,
+            vec![InsertionMode::InBody]
+        );
+        let p = builder.open_elements.current_node().unwrap();
+        assert_eq!(builder.document.parent(p), Some(content));
+        assert_eq!(
+            builder.document.children(template).collect::<Vec<_>>(),
+            vec![content]
+        );
+    }
+
+    #[test]
+    fn in_template_tr_cascades_through_in_table_body_and_in_row() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_head(&mut builder);
+        builder.process_token(&start_tag("template"), pos());
+        let template = builder.open_elements.current_node().unwrap();
+        let content = builder.document.children(template).next().unwrap();
+
+        // "In template"'s own `tr` arm just switches to "in table body"
+        // and reprocesses — which is what actually inserts `tr` and
+        // moves on to "in row" (§13.2.6.4.13). `process_token` drives
+        // that whole cascade to completion before returning.
+        builder.process_token(&start_tag("tr"), pos());
+        assert_eq!(builder.insertion_mode, InsertionMode::InRow);
+        // The template-insertion-modes stack only reflects the mode
+        // "in template" itself switched to — the "in table body" ->
+        // "in row" transition is an ordinary table-mode cascade, not a
+        // template-specific one, so it doesn't touch this stack.
+        assert_eq!(
+            builder.stack_of_template_insertion_modes,
+            vec![InsertionMode::InTableBody]
+        );
+        let tr = builder.open_elements.current_node().unwrap();
+        assert_eq!(builder.document.parent(tr), Some(content));
+
+        builder.process_token(&start_tag("td"), pos());
+        assert_eq!(builder.insertion_mode, InsertionMode::InCell);
+        let td = builder.open_elements.current_node().unwrap();
+        assert_eq!(builder.document.parent(td), Some(tr));
+    }
+
+    #[test]
+    fn in_template_any_other_end_tag_is_ignored() {
+        let mut builder = TreeBuilder::new();
+        bootstrap_in_head(&mut builder);
+        builder.process_token(&start_tag("template"), pos());
+        let current_before = builder.open_elements.current_node();
+
+        builder.process_token(&end_tag("p"), pos());
+
+        assert_eq!(builder.insertion_mode, InsertionMode::InTemplate);
+        assert_eq!(builder.open_elements.current_node(), current_before);
     }
 
     #[test]

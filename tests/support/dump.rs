@@ -98,6 +98,18 @@ fn dump_node(document: &Document, id: NodeId, depth: usize, lines: &mut Vec<Stri
         NodeKind::ProcessingInstruction { target, data } => {
             lines.push(format!("{}<?{target} {data}?>", indent(depth)));
         }
+        NodeKind::DocumentFragment => {
+            // A `template` element's contents — the format represents
+            // it as a synthetic "content" line, with the real children
+            // nested one level deeper than it (matching the reference
+            // serializer's `depth + 2` relative to the `template`
+            // element itself; `depth` here is already `template`'s
+            // `depth + 1`, so `depth + 1` below lands on the same spot).
+            lines.push(format!("{}content", indent(depth)));
+            for child in document.children(id) {
+                dump_node(document, child, depth + 1, lines);
+            }
+        }
         NodeKind::Element {
             name,
             namespace,

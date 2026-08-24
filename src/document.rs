@@ -58,12 +58,15 @@ impl From<TokenAttribute> for Attribute {
     }
 }
 
-/// The kind of a document node and its associated data. Deliberately
-/// covers only what the HTML5 tokenizer can actually produce a token for
-/// (§13.2.5's token kinds) — no `CData`/`EntityRef` variants, since the
-/// HTML5 tokenizer never emits those (character references and CDATA
-/// content both resolve straight to character tokens, see
-/// `tokenizer::TokenKind`'s doc comment).
+/// The kind of a document node and its associated data. Mostly covers
+/// what the HTML5 tokenizer can actually produce a token for (§13.2.5's
+/// token kinds) — no `CData`/`EntityRef` variants, since the HTML5
+/// tokenizer never emits those (character references and CDATA content
+/// both resolve straight to character tokens, see
+/// `tokenizer::TokenKind`'s doc comment). [`DocumentFragment`](Self::DocumentFragment)
+/// is the one exception: not tokenizer-token-shaped at all, synthesized
+/// directly by tree construction (§13.2.6.1's "create an element for a
+/// token" step, for `template` elements specifically).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeKind {
     /// The document node — there is exactly one per [`Document`].
@@ -93,6 +96,17 @@ pub enum NodeKind {
         public_identifier: Option<String>,
         system_identifier: Option<String>,
     },
+    /// A `template` element's "template contents" — an inert fragment
+    /// root that real content inserted "inside" a `template` element
+    /// actually lands in, per §13.2.6.1's "appropriate place for
+    /// inserting a node". Modeled here as the template element's sole
+    /// real tree child (created alongside it, see
+    /// `tree_builder.rs::create_element_for_token`), since `Document`
+    /// has no separate out-of-tree fragment concept — matching how
+    /// html5lib-tests' own `#document` dump format represents it (a
+    /// synthetic `content` line, with the real children nested one
+    /// level below that).
+    DocumentFragment,
 }
 
 /// A single node in a [`Document`]'s arena: its kind/payload, its source

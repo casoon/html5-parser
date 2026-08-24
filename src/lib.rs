@@ -642,4 +642,33 @@ mod tests {
         assert_eq!(name, "frameset");
         assert_eq!(document.children(frameset).count(), 0);
     }
+
+    #[test]
+    fn template_content_is_a_separate_fragment_from_the_template_element() {
+        // html5lib-tests' template.dat#0: `<template>`'s real content
+        // model (§13.2.6.4.4/.16) — its child is a `DocumentFragment`
+        // ("template contents"), not the text directly.
+        let document = parse("<body><template>Hello</template>");
+        let body = body_of(&document);
+
+        let template = document.children(body).next().unwrap();
+        let NodeKind::Element { name, .. } = &document.node(template).kind else {
+            unreachable!()
+        };
+        assert_eq!(name, "template");
+
+        let template_children: Vec<_> = document.children(template).collect();
+        assert_eq!(template_children.len(), 1);
+        let content = template_children[0];
+        assert_eq!(document.node(content).kind, NodeKind::DocumentFragment);
+
+        let content_children: Vec<_> = document.children(content).collect();
+        assert_eq!(content_children.len(), 1);
+        assert_eq!(
+            document.node(content_children[0]).kind,
+            NodeKind::Text {
+                content: "Hello".to_owned()
+            }
+        );
+    }
 }

@@ -58,9 +58,16 @@ than oversights — being closed out one by one ahead of a first
   are implemented, including `<frameset>` correctly replacing (rather
   than nesting under) `<body>` per §13.2.6.4.7/.4.6's real rules. See
   `plan/04-frameset.md`.
-- **`<template>`** is still treated as an ordinary element — no inert
-  content-fragment semantics, no template insertion-modes stack, no
-  shadow-root handling (§13.2.6.4.4's simplification).
+- ~~`<template>` treated as an ordinary element~~ — **done** (the
+  classic content model): `<template>` gets a real, separate
+  `NodeKind::DocumentFragment` "template contents" (§13.2.6.4.4/.16,
+  the stack of template insertion modes, the active-formatting-elements
+  marker). **Still not implemented** — two much newer, still-evolving
+  sub-features layered onto `<template>` in the current spec, neither
+  exercised by the html5lib-tests corpus: declarative shadow DOM
+  (`shadowrootmode` and friends) and content patching (the `for`
+  attribute) — both would require modeling shadow roots/custom element
+  registries this crate has no other use for. See `plan/05-template.md`.
 - **`<selectedcontent>`** (the "customizable `<select>`" proposal's
   live-mirrored-content element, a recent, still-evolving spec addition)
   is still parsed as an ordinary element — its content is not populated
@@ -74,9 +81,9 @@ Besides hand-written unit/end-to-end tests (`src/tokenizer.rs`,
 `tests/html5lib_conformance.rs`: every applicable case (full-document,
 non-fragment, non-scripting — see `tests/html5lib-tests/README.md`) from
 the vendored [html5lib-tests](https://github.com/html5lib/html5lib-tests)
-tree-construction corpus — currently 1,726 applicable cases, 1,610
-passing (93%). Known failures (all attributable to the two remaining
-"Known limitations" above) are tracked explicitly in
+tree-construction corpus — currently 1,726 applicable cases, 1,722
+passing (99.8%). The 4 known failures (all `<selectedcontent>`, the one
+remaining "Known limitation" above) are tracked explicitly in
 `tests/html5lib_known_failures.txt` rather than silently ignored; see
 that file's header for how to regenerate it.
 
