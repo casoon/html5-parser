@@ -38,11 +38,13 @@ pub struct ParseError {
 /// PascalCase. Only variants this crate actually detects and reports
 /// exist — no catch-all/string-payload variant, so matching on a
 /// specific kind stays meaningful. `#[non_exhaustive]` because more
-/// variants are expected in follow-up phases (`plan/07-parse-errors.md`:
-/// tokenizer-level errors only so far — tree-construction-level errors,
-/// e.g. stray end tags across the whole document, are follow-up work,
-/// not yet represented here) — adding one later must not be a breaking
-/// change for any caller matching on this type.
+/// variants may still be added: the tokenizer level (§13.2.5,
+/// `plan/07-parse-errors.md`) is complete at 50 of the 52 named errors,
+/// but the tree-construction level (§13.2.6,
+/// `plan/08-tree-construction-errors.md`) covers only the conditions
+/// with a demonstrated consumer need, not all of §13.2.6's unnamed
+/// ones — adding one later must not be a breaking change for any caller
+/// matching on this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParseErrorKind {
@@ -109,6 +111,33 @@ pub enum ParseErrorKind {
     // detect, so no dead variant for it.
     NoncharacterInInputStream,
     ControlCharacterInInputStream,
+    // Tree construction (§13.2.6) — see `plan/08-tree-construction-errors.md`.
+    //
+    // Unlike every variant above, §13.2.6 gives these conditions **no**
+    // names: the algorithm just says "this is a parse error" inline,
+    // with no equivalent of §13.2.2's alphabetical name glossary. These
+    // variant names therefore describe the condition itself rather than
+    // transcribing a spec identifier. The one exception is
+    // `NonVoidHtmlElementStartTagWithTrailingSolidus`, which *is* a real
+    // §13.2.2 name — it lives down here rather than up with the other
+    // named errors because only the tree-construction stage can decide
+    // it (the tokenizer does not know whether an element is void, so
+    // Phase 07's slice 1 deliberately left it out).
+    ImpliedEndTagWithUnclosedElements,
+    EndTagPWithoutPInButtonScope,
+    StrayEndTag,
+    EndTagBr,
+    NonVoidHtmlElementStartTagWithTrailingSolidus,
+    EofWithUnclosedElements,
+    EofInTextMode,
+    StartTagImage,
+    NestedForm,
+    StartTagTableInTable,
+    MisplacedTokenInTable,
+    NonSpaceCharactersInTable,
+    StrayEndTagInTable,
+    TokenAfterBody,
+    StrayDoctype,
 }
 
 impl std::fmt::Display for ParseErrorKind {
@@ -211,6 +240,29 @@ impl std::fmt::Display for ParseErrorKind {
             Self::EofInCdata => "end of file inside a CDATA section",
             Self::NoncharacterInInputStream => "a Unicode noncharacter in the input stream",
             Self::ControlCharacterInInputStream => "a control character in the input stream",
+            Self::ImpliedEndTagWithUnclosedElements => {
+                "an implied \"p\" end tag with elements still open"
+            }
+            Self::EndTagPWithoutPInButtonScope => {
+                "a \"p\" end tag with no \"p\" element in button scope"
+            }
+            Self::StrayEndTag => "a stray end tag with no matching open element",
+            Self::EndTagBr => "a \"br\" end tag",
+            Self::NonVoidHtmlElementStartTagWithTrailingSolidus => {
+                "self-closing syntax (\"/>\") on a non-void HTML element"
+            }
+            Self::EofWithUnclosedElements => "end of file with elements still open",
+            Self::EofInTextMode => "end of file when expecting text or an end tag",
+            Self::StartTagImage => "an \"image\" start tag (treated as \"img\")",
+            Self::NestedForm => "a \"form\" start tag while another \"form\" is still open",
+            Self::StartTagTableInTable => {
+                "a \"table\" start tag while the previous \"table\" is still open"
+            }
+            Self::MisplacedTokenInTable => "a misplaced token inside a table",
+            Self::NonSpaceCharactersInTable => "misplaced non-space characters inside a table",
+            Self::StrayEndTagInTable => "a stray end tag inside a table",
+            Self::TokenAfterBody => "a token after the \"body\" element had been closed",
+            Self::StrayDoctype => "a stray DOCTYPE",
         };
         f.write_str(text)
     }

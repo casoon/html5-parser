@@ -9,7 +9,9 @@
 // is the real entry point, driven end to end by `lib.rs::parse()`.
 
 use crate::document::{Attribute, Document, NodeId, NodeKind};
-use crate::tokenizer::{DoctypeToken, ExternalState, Position, TagToken, TokenKind};
+use crate::tokenizer::{
+    DoctypeToken, ExternalState, ParseError, ParseErrorKind, Position, TagToken, TokenKind,
+};
 
 /// The HTML namespace URI (https://infra.spec.whatwg.org/#html-namespace).
 pub(crate) const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
@@ -1565,6 +1567,20 @@ pub(crate) struct TreeBuilder {
     /// `reset_the_insertion_mode_appropriately` (a `template` current
     /// node switches to this stack's top, not a fixed mode).
     stack_of_template_insertion_modes: Vec<InsertionMode>,
+    /// Tree-construction-stage parse errors (§13.2.6), collected exactly
+    /// the way [`crate::tokenizer::Tokenizer`] collects its own
+    /// (`plan/07-parse-errors.md`) and merged with them by
+    /// `lib.rs::parse`. See `plan/08-tree-construction-errors.md` for
+    /// which conditions are covered and which are deliberately left out.
+    errors: Vec<ParseError>,
+    /// "Acknowledge the token's self-closing flag" (§13.2.5): a start tag
+    /// token emitted with its self-closing flag set is a
+    /// `non-void-html-element-start-tag-with-trailing-solidus` parse
+    /// error *unless* the tree-construction rule that handles it
+    /// acknowledges the flag. Reset before each start tag token in
+    /// [`process_token`](Self::process_token), set by the rules the spec
+    /// says acknowledge it, and checked afterwards.
+    self_closing_flag_acknowledged: bool,
 }
 
 impl TreeBuilder {
@@ -1583,7 +1599,28 @@ impl TreeBuilder {
             skip_next_line_feed: false,
             pending_table_character_tokens: Vec::new(),
             stack_of_template_insertion_modes: Vec::new(),
+            errors: Vec::new(),
+            self_closing_flag_acknowledged: false,
         }
+    }
+
+    /// Records a tree-construction parse error at `position`.
+    fn error(&mut self, kind: ParseErrorKind, position: Position) {
+        self.errors.push(ParseError { kind, position });
+    }
+
+    /// Drains and returns every tree-construction [`ParseError`] recorded
+    /// so far. Called once by `lib.rs::parse` after parsing finishes.
+    pub(crate) fn take_errors(&mut self) -> Vec<ParseError> {
+        std::mem::take(&mut self.errors)
+    }
+
+    /// "Acknowledge the token's self-closing flag" (§13.2.5) — called by
+    /// every rule the spec says does so, suppressing the
+    /// `non-void-html-element-start-tag-with-trailing-solidus` check in
+    /// [`process_token`](Self::process_token).
+    fn acknowledge_self_closing_flag(&mut self) {
+        self.self_closing_flag_acknowledged = true;
     }
 
     /// "The appropriate place for inserting a node" (§13.2.6.1), given an
@@ -1927,7 +1964,7 @@ impl TreeBuilder {
     /// now, ahead of "in body" itself (not yet implemented — see
     /// plan/03-tree-construction.md), because the adoption agency
     /// algorithm cannot be complete without it.
-    fn any_other_end_tag_in_body(&mut self, tag: &TagToken) {
+    fn any_other_end_tag_in_body(&mut self, tag: &TagToken, position: Position) {
         let mut node = self
             .open_elements
             .current_node()
@@ -1955,6 +1992,9 @@ impl TreeBuilder {
                 return;
             }
             if is_special(&self.document, node) {
+                // "Otherwise, if node is in the special category, then
+                // this is a parse error; ignore the token, and return."
+                self.error(ParseErrorKind::StrayEndTag, position);
                 return;
             }
             node = self.open_elements.element_immediately_above(node).expect(
@@ -1971,7 +2011,7 @@ impl TreeBuilder {
     /// its own isolated step per plan/03-tree-construction.md (notorious
     /// for subtle bugs in other implementations), ahead of "in body"
     /// itself (not yet implemented) actually calling it.
-    fn adoption_agency_algorithm(&mut self, tag: &TagToken) {
+    fn adoption_agency_algorithm(&mut self, tag: &TagToken, position: Position) {
         let subject = tag.name.as_str();
 
         // Step 2: the common, non-misnested case — the current node
@@ -2017,7 +2057,7 @@ impl TreeBuilder {
                     FormattingEntry::Marker => None,
                 });
             let Some(formatting_element) = formatting_element else {
-                self.any_other_end_tag_in_body(tag);
+                self.any_other_end_tag_in_body(tag, position);
                 return;
             };
 
@@ -2445,17 +2485,39 @@ impl TreeBuilder {
         kind: &TokenKind,
         position: Position,
     ) -> Option<ExternalState> {
-        loop {
+        // §13.2.5: "When a start tag token is emitted with its
+        // self-closing flag set, if the flag is not acknowledged when it
+        // is processed by the tree construction stage, that is a
+        // non-void-html-element-start-tag-with-trailing-solidus parse
+        // error." Only meaningful for start tags, and only decidable
+        // here — the tokenizer cannot know whether an element is void.
+        let self_closing_start_tag = matches!(
+            kind,
+            TokenKind::StartTag(tag) if tag.self_closing
+        );
+        if self_closing_start_tag {
+            self.self_closing_flag_acknowledged = false;
+        }
+
+        let state = loop {
             let outcome = if self.should_process_as_foreign_content(kind) {
                 self.process_token_foreign_content(kind, position)
             } else {
                 self.process_token_by_insertion_mode(kind, position)
             };
             match outcome {
-                TokenOutcome::Consumed(state) => return state,
+                TokenOutcome::Consumed(state) => break state,
                 TokenOutcome::Reprocess => continue,
             }
+        };
+
+        if self_closing_start_tag && !self.self_closing_flag_acknowledged {
+            self.error(
+                ParseErrorKind::NonVoidHtmlElementStartTagWithTrailingSolidus,
+                position,
+            );
         }
+        state
     }
 
     /// Dispatches to the handler for the current insertion mode — "process
@@ -2699,6 +2761,7 @@ impl TreeBuilder {
                     // element) reduce to the same pop once script
                     // execution is stripped out.
                     self.open_elements.pop();
+                    self.acknowledge_self_closing_flag();
                 }
                 TokenOutcome::Consumed(None)
             }
@@ -2818,7 +2881,11 @@ impl TreeBuilder {
     /// The "before html" insertion mode (§13.2.6.4.2).
     fn process_token_before_html(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
         match kind {
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::Comment(data) => {
                 self.append_comment_to_document(data.clone(), position);
                 TokenOutcome::Consumed(None)
@@ -2886,7 +2953,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.merge_attributes_onto_html_element(tag);
                 TokenOutcome::Consumed(None)
@@ -3241,14 +3312,57 @@ impl TreeBuilder {
         }
     }
 
+    /// The open-element check shared verbatim by "in body"'s
+    /// end-of-file, `</body>` and `</html>` rules (§13.2.6.4.7): "If
+    /// there is a node in the stack of open elements that is not either
+    /// a dd element, a dt element, an li element, an optgroup element,
+    /// an option element, a p element, an rb element, an rp element, an
+    /// rt element, an rtc element, a tbody element, a td element, a
+    /// tfoot element, a th element, a thead element, a tr element, the
+    /// body element, or the html element, then this is a parse error."
+    ///
+    /// In practice: everything in this list either has an optional end
+    /// tag or is one of the two implied document-structure elements, so
+    /// anything *else* still being open at this point means the author
+    /// left a real element unclosed.
+    fn has_unexpected_open_elements(&self) -> bool {
+        const ALLOWED_UNCLOSED: &[&str] = &[
+            "dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc", "tbody", "td",
+            "tfoot", "th", "thead", "tr", "body", "html",
+        ];
+        self.open_elements.entries.iter().any(|&node| {
+            let NodeKind::Element {
+                name, namespace, ..
+            } = &self.document.node(node).kind
+            else {
+                return false;
+            };
+            namespace.as_deref() != Some(HTML_NAMESPACE)
+                || !ALLOWED_UNCLOSED.contains(&name.as_str())
+        })
+    }
+
     /// "Close a p element" (§13.2.6.4.7): generate implied end tags
     /// except for `p` elements, then pop until a `p` element has been
     /// popped. Callers are expected to have already checked
     /// `has_element_in_button_scope("p")` first, per every one of this
     /// helper's actual call sites in the spec.
-    fn close_a_p_element(&mut self) {
+    ///
+    /// Between those two steps sits the spec's own "If the current node
+    /// is not a p element, then this is a parse error" — i.e. something
+    /// other than the `p` (and other than the implied-end-tag set just
+    /// popped) is still open and about to be closed implicitly.
+    /// `position` is the position of the token that triggered the close.
+    fn close_a_p_element(&mut self, position: Position) {
         self.open_elements
             .generate_implied_end_tags(&self.document, Some("p"));
+        let current_node_is_p = self
+            .open_elements
+            .current_node()
+            .is_some_and(|node| self.node_has_html_name(node, "p"));
+        if !current_node_is_p {
+            self.error(ParseErrorKind::ImpliedEndTagWithUnclosedElements, position);
+        }
         self.pop_until_one_of_popped(&["p"]);
     }
 
@@ -3282,14 +3396,13 @@ impl TreeBuilder {
     /// `area`/`br`/`embed`/`img`/`keygen`/`wbr`, and the `<br>`
     /// end-tag-treated-as-start-tag rewrite): reconstruct the active
     /// formatting elements, insert an HTML element for the token,
-    /// immediately pop it back off, and mark the frameset-ok flag "not
-    /// ok". Self-closing-flag acknowledgment is a parse-error-
-    /// suppression detail this crate has no diagnostics to suppress, so
-    /// it's omitted, as elsewhere.
+    /// immediately pop it back off, acknowledge the token's self-closing
+    /// flag, and mark the frameset-ok flag "not ok".
     fn insert_void_element(&mut self, tag: &TagToken, position: Option<Position>) {
         self.reconstruct_the_active_formatting_elements();
         self.insert_html_element(tag, position);
         self.open_elements.pop();
+        self.acknowledge_self_closing_flag();
         self.frameset_ok = false;
     }
 
@@ -3457,7 +3570,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.merge_attributes_onto_html_element(tag);
                 TokenOutcome::Consumed(None)
@@ -3470,6 +3587,7 @@ impl TreeBuilder {
             {
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
+                self.acknowledge_self_closing_flag();
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "title" => {
@@ -3567,7 +3685,11 @@ impl TreeBuilder {
         position: Position,
     ) -> TokenOutcome {
         match kind {
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.merge_attributes_onto_html_element(tag);
                 TokenOutcome::Consumed(None)
@@ -3632,7 +3754,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.merge_attributes_onto_html_element(tag);
                 TokenOutcome::Consumed(None)
@@ -3763,7 +3889,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.merge_attributes_onto_html_element(tag);
                 TokenOutcome::Consumed(None)
@@ -3830,9 +3960,11 @@ impl TreeBuilder {
                 if !self.stack_of_template_insertion_modes.is_empty() {
                     return self.process_token_in_template(kind, position);
                 }
-                // The parse-error check has no tree-shape effect. "Stop
-                // parsing" itself is a driver-loop concern, not yet
-                // built.
+                if self.has_unexpected_open_elements() {
+                    self.error(ParseErrorKind::EofWithUnclosedElements, position);
+                }
+                // "Stop parsing" itself is a driver-loop concern, not
+                // yet built.
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "body" => {
@@ -3841,6 +3973,9 @@ impl TreeBuilder {
                     .has_element_in_scope(&self.document, "body")
                 {
                     return TokenOutcome::Consumed(None);
+                }
+                if self.has_unexpected_open_elements() {
+                    self.error(ParseErrorKind::EofWithUnclosedElements, position);
                 }
                 self.insertion_mode = InsertionMode::AfterBody;
                 TokenOutcome::Consumed(None)
@@ -3851,6 +3986,9 @@ impl TreeBuilder {
                     .has_element_in_scope(&self.document, "body")
                 {
                     return TokenOutcome::Consumed(None);
+                }
+                if self.has_unexpected_open_elements() {
+                    self.error(ParseErrorKind::EofWithUnclosedElements, position);
                 }
                 self.insertion_mode = InsertionMode::AfterBody;
                 TokenOutcome::Reprocess
@@ -3889,7 +4027,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(None)
@@ -3901,7 +4039,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 let current_is_heading = self.open_elements.current_node().is_some_and(|node| {
                     ["h1", "h2", "h3", "h4", "h5", "h6"]
@@ -3919,7 +4057,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.insert_html_element(tag, Some(position));
                 self.skip_next_line_feed = true;
@@ -3928,13 +4066,18 @@ impl TreeBuilder {
             }
             TokenKind::StartTag(tag) if tag.name == "form" => {
                 if self.form_element_pointer.is_some() && !self.has_template_on_stack() {
+                    // "If the form element pointer is not null, and
+                    // there is no template element on the stack of open
+                    // elements, then this is a parse error; ignore the
+                    // token."
+                    self.error(ParseErrorKind::NestedForm, position);
                     return TokenOutcome::Consumed(None);
                 }
                 if self
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 let form = self.insert_html_element(tag, Some(position));
                 if !self.has_template_on_stack() {
@@ -3965,7 +4108,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(None)
@@ -3999,7 +4142,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(None)
@@ -4009,7 +4152,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.insert_html_element(tag, Some(position));
                 TokenOutcome::Consumed(Some(ExternalState::PlainText))
@@ -4101,6 +4244,11 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
+                    // "If the stack of open elements does not have a p
+                    // element in button scope, then this is a parse
+                    // error; insert an HTML element for a 'p' start tag
+                    // token with no attributes."
+                    self.error(ParseErrorKind::EndTagPWithoutPInButtonScope, position);
                     let p_tag = TagToken {
                         name: "p".to_owned(),
                         self_closing: false,
@@ -4108,7 +4256,7 @@ impl TreeBuilder {
                     };
                     self.insert_html_element(&p_tag, None);
                 }
-                self.close_a_p_element();
+                self.close_a_p_element(position);
                 let _ = tag;
                 TokenOutcome::Consumed(None)
             }
@@ -4168,7 +4316,7 @@ impl TreeBuilder {
                         _ => None,
                     });
                 if let Some(existing_a) = existing_a {
-                    self.adoption_agency_algorithm(tag);
+                    self.adoption_agency_algorithm(tag, position);
                     self.remove_node_from_active_formatting_elements(existing_a);
                     self.remove_node_from_open_elements(existing_a);
                 }
@@ -4206,7 +4354,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, "nobr")
                 {
-                    self.adoption_agency_algorithm(tag);
+                    self.adoption_agency_algorithm(tag, position);
                     self.reconstruct_the_active_formatting_elements();
                 }
                 let element = self.insert_html_element(tag, Some(position));
@@ -4232,7 +4380,7 @@ impl TreeBuilder {
                         | "u"
                 ) =>
             {
-                self.adoption_agency_algorithm(tag);
+                self.adoption_agency_algorithm(tag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag)
@@ -4265,7 +4413,7 @@ impl TreeBuilder {
                         .open_elements
                         .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.insert_html_element(tag, Some(position));
                 self.frameset_ok = false;
@@ -4273,6 +4421,10 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "br" => {
+                // "Parse error. Drop the attributes from the token, and
+                // act as described in the next entry; i.e. act as if
+                // this was a 'br' start tag token with no attributes."
+                self.error(ParseErrorKind::EndTagBr, position);
                 let br_tag = TagToken {
                     name: "br".to_owned(),
                     self_closing: false,
@@ -4303,6 +4455,7 @@ impl TreeBuilder {
                 self.reconstruct_the_active_formatting_elements();
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
+                self.acknowledge_self_closing_flag();
                 let is_hidden_type = tag
                     .attributes
                     .iter()
@@ -4318,6 +4471,7 @@ impl TreeBuilder {
             {
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
+                self.acknowledge_self_closing_flag();
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "hr" => {
@@ -4325,7 +4479,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 if self
                     .open_elements
@@ -4338,10 +4492,14 @@ impl TreeBuilder {
                 }
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
+                self.acknowledge_self_closing_flag();
                 self.frameset_ok = false;
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "image" => {
+                // §13.2.6.4.7: "Parse error. Change the token's tag name
+                // to 'img' and reprocess it. (Don't ask.)"
+                self.error(ParseErrorKind::StartTagImage, position);
                 let img_tag = TagToken {
                     name: "img".to_owned(),
                     ..tag.clone()
@@ -4363,7 +4521,7 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_button_scope(&self.document, "p")
                 {
-                    self.close_a_p_element();
+                    self.close_a_p_element(position);
                 }
                 self.reconstruct_the_active_formatting_elements();
                 self.frameset_ok = false;
@@ -4472,6 +4630,7 @@ impl TreeBuilder {
                 self.insert_foreign_element(tag, MATHML_NAMESPACE, false, Some(position));
                 if tag.self_closing {
                     self.open_elements.pop();
+                    self.acknowledge_self_closing_flag();
                 }
                 TokenOutcome::Consumed(None)
             }
@@ -4480,6 +4639,7 @@ impl TreeBuilder {
                 self.insert_foreign_element(tag, SVG_NAMESPACE, false, Some(position));
                 if tag.self_closing {
                     self.open_elements.pop();
+                    self.acknowledge_self_closing_flag();
                 }
                 TokenOutcome::Consumed(None)
             }
@@ -4508,7 +4668,7 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) => {
-                self.any_other_end_tag_in_body(tag);
+                self.any_other_end_tag_in_body(tag, position);
                 TokenOutcome::Consumed(None)
             }
         }
@@ -4540,10 +4700,12 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::Eof => {
-                // The parse-error check and "if current node is a
-                // script element, set its already started flag" have
-                // no tree-shape effect (no diagnostics, no script
-                // execution in this crate).
+                // "An end-of-file token: Parse error. If the current
+                // node is a script element, then set its already
+                // started to true. Pop the current node off the stack
+                // of open elements. ..." (the already-started flag has
+                // no effect here — this crate executes no scripts).
+                self.error(ParseErrorKind::EofInTextMode, position);
                 self.open_elements.pop();
                 self.insertion_mode = self.original_insertion_mode.take().expect(
                     "\"text\" mode is only entered via \
@@ -4615,7 +4777,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "caption" => {
                 self.clear_stack_back_to_a_table_context();
                 self.active_formatting_elements.push_marker();
@@ -4660,6 +4826,10 @@ impl TreeBuilder {
                 TokenOutcome::Reprocess
             }
             TokenKind::StartTag(tag) if tag.name == "table" => {
+                // "A start tag whose tag name is 'table': Parse error."
+                // — unconditional, ahead of the in-table-scope check
+                // that only decides whether the token is *ignored*.
+                self.error(ParseErrorKind::StartTagTableInTable, position);
                 if !self
                     .open_elements
                     .has_element_in_table_scope(&self.document, "table")
@@ -4697,6 +4867,8 @@ impl TreeBuilder {
                         | "tr"
                 ) =>
             {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTagInTable, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag)
@@ -4714,10 +4886,16 @@ impl TreeBuilder {
                     .find(|attribute| attribute.name == "type")
                     .is_some_and(|attribute| attribute.value.eq_ignore_ascii_case("hidden"));
                 if !is_hidden_type {
+                    self.error(ParseErrorKind::MisplacedTokenInTable, position);
                     return self.in_table_anything_else(kind, position);
                 }
+                // The "otherwise" branch is itself a parse error too
+                // ("Parse error. Insert an HTML element for the token
+                // ..."), reported with the same kind.
+                self.error(ParseErrorKind::MisplacedTokenInTable, position);
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
+                self.acknowledge_self_closing_flag();
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "form" => {
@@ -4730,7 +4908,13 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::Eof => self.process_token_in_body(kind, position),
-            _ => self.in_table_anything_else(kind, position),
+            _ => {
+                // "Anything else: Parse error. Enable foster parenting,
+                // process the token using the rules for the 'in body'
+                // insertion mode, and then disable foster parenting."
+                self.error(ParseErrorKind::MisplacedTokenInTable, position);
+                self.in_table_anything_else(kind, position)
+            }
         }
     }
 
@@ -4753,6 +4937,18 @@ impl TreeBuilder {
                 let tokens = std::mem::take(&mut self.pending_table_character_tokens);
                 let has_non_whitespace = tokens.iter().any(|&(c, _)| !is_whitespace(c));
                 if has_non_whitespace {
+                    // "If any of the tokens in the pending table
+                    // character tokens list are character tokens that
+                    // are not ASCII whitespace, then this is a parse
+                    // error" — once for the run, not once per character
+                    // (which is also why "in table"'s own "anything
+                    // else" error is emitted at its call sites rather
+                    // than inside `in_table_anything_else`).
+                    let first = tokens
+                        .first()
+                        .expect("has_non_whitespace implies a non-empty list")
+                        .1;
+                    self.error(ParseErrorKind::NonSpaceCharactersInTable, first);
                     for &(c, char_position) in &tokens {
                         self.in_table_anything_else(&TokenKind::Character(c), char_position);
                     }
@@ -4870,13 +5066,18 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.process_token_in_body(kind, position)
             }
             TokenKind::StartTag(tag) if tag.name == "col" => {
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
+                self.acknowledge_self_closing_flag();
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "colgroup" => {
@@ -5222,7 +5423,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.process_token_in_body(kind, position)
             }
@@ -5239,6 +5444,9 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             _ => {
+                // "Anything else: Parse error. Switch the insertion
+                // mode to 'in body' and reprocess the token."
+                self.error(ParseErrorKind::TokenAfterBody, position);
                 self.insertion_mode = InsertionMode::InBody;
                 TokenOutcome::Reprocess
             }
@@ -5264,7 +5472,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.process_token_in_body(kind, position)
             }
@@ -5291,8 +5503,7 @@ impl TreeBuilder {
             TokenKind::StartTag(tag) if tag.name == "frame" => {
                 self.insert_html_element(tag, Some(position));
                 self.open_elements.pop();
-                // "Acknowledge the token's self-closing flag" has no
-                // tree-shape effect (no diagnostics tracked).
+                self.acknowledge_self_closing_flag();
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "noframes" => {
@@ -5333,7 +5544,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "html" => {
                 self.process_token_in_body(kind, position)
             }
@@ -6175,7 +6390,15 @@ mod active_formatting_elements_tests {
 mod adoption_agency_tests {
     use super::TreeBuilder;
     use crate::document::{NodeId, NodeKind};
-    use crate::tokenizer::TagToken;
+    use crate::tokenizer::{Position, TagToken};
+
+    fn pos() -> Position {
+        Position {
+            line: 1,
+            column: 1,
+            byte_offset: 0,
+        }
+    }
 
     fn tag(name: &str) -> TagToken {
         TagToken {
@@ -6212,7 +6435,7 @@ mod adoption_agency_tests {
         let body = builder.insert_html_element(&tag("body"), None);
         let b = builder.insert_html_element(&tag("b"), None);
 
-        builder.adoption_agency_algorithm(&tag("b"));
+        builder.adoption_agency_algorithm(&tag("b"), pos());
 
         assert_eq!(builder.open_elements.current_node(), Some(body));
         // The element itself is untouched in the tree, just off the
@@ -6233,7 +6456,7 @@ mod adoption_agency_tests {
             .active_formatting_elements
             .push(&builder.document, b);
 
-        builder.adoption_agency_algorithm(&tag("b"));
+        builder.adoption_agency_algorithm(&tag("b"), pos());
 
         assert_eq!(builder.open_elements.current_node(), Some(p));
         assert!(!builder.open_elements.contains(b));
@@ -6258,7 +6481,7 @@ mod adoption_agency_tests {
             .push(&builder.document, b);
         let table = builder.insert_html_element(&tag("table"), None);
 
-        builder.adoption_agency_algorithm(&tag("b"));
+        builder.adoption_agency_algorithm(&tag("b"), pos());
 
         // Nothing changed: no pop, no tree mutation.
         assert_eq!(builder.open_elements.current_node(), Some(table));
@@ -6292,7 +6515,7 @@ mod adoption_agency_tests {
         );
         builder.document.append_child(div, inner_text);
 
-        builder.adoption_agency_algorithm(&tag("b"));
+        builder.adoption_agency_algorithm(&tag("b"), pos());
 
         // Stack: html, body, div — both `b` (the original) and its
         // clone are fully popped off by the end (the clone itself hits
@@ -6332,7 +6555,7 @@ mod adoption_agency_tests {
         let div = builder.insert_html_element(&tag("div"), None);
         builder.insert_html_element(&tag("span"), None);
 
-        builder.any_other_end_tag_in_body(&tag("div"));
+        builder.any_other_end_tag_in_body(&tag("div"), pos());
 
         assert_eq!(builder.open_elements.current_node(), Some(body));
         assert!(!builder.open_elements.contains(div));
@@ -6347,7 +6570,7 @@ mod adoption_agency_tests {
         let span = builder.insert_html_element(&tag("span"), None);
 
         // No `x` element exists anywhere on the stack.
-        builder.any_other_end_tag_in_body(&tag("x"));
+        builder.any_other_end_tag_in_body(&tag("x"), pos());
 
         // Nothing was popped: the search hit `div` (special) before
         // finding a match and gave up.

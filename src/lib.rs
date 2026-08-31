@@ -45,10 +45,14 @@ pub struct ParseResult {
 /// elements") isn't implied by the loop simply ending.
 ///
 /// Returns [`ParseResult`], not a bare [`Document`], as of Phase 07
-/// (`plan/07-parse-errors.md`) — `errors` currently covers every
-/// tokenizer-level parse error (`src/tokenizer.rs`'s `error()` call
-/// sites); tree-construction-level errors (e.g. stray end tags) are
-/// follow-up work, not yet collected here.
+/// (`plan/07-parse-errors.md`) — `errors` covers every tokenizer-level
+/// parse error (`src/tokenizer.rs`'s `error()` call sites) plus, as of
+/// Phase 08 (`plan/08-tree-construction-errors.md`), the
+/// tree-construction-level (§13.2.6) conditions listed there. Both
+/// sources are merged and sorted by source position, so `errors` is
+/// always in document order regardless of which stage produced each
+/// entry (the two stages interleave: the tokenizer runs ahead of the
+/// tree builder token by token).
 pub fn parse(input: &str) -> ParseResult {
     let mut tokenizer = Tokenizer::new(input);
     let mut tree_builder = TreeBuilder::new();
@@ -59,9 +63,15 @@ pub fn parse(input: &str) -> ParseResult {
         tokenizer.set_in_foreign_content(tree_builder.is_in_foreign_content());
     }
     tree_builder.stop_parsing();
+    let mut errors = tokenizer.take_errors();
+    errors.append(&mut tree_builder.take_errors());
+    // Stable, so two errors reported at the same position keep their
+    // relative order (tokenizer-first, matching the order the stages
+    // actually observe a given token).
+    errors.sort_by_key(|error| error.position.byte_offset);
     ParseResult {
         document: tree_builder.into_document(),
-        errors: tokenizer.take_errors(),
+        errors,
     }
 }
 
@@ -716,6 +726,268 @@ mod tests {
             NodeKind::Text {
                 content: "Y".to_owned()
             }
+        );
+    }
+}
+
+/// Phase 08 (`plan/08-tree-construction-errors.md`): one minimal
+/// trigger per tree-construction [`ParseErrorKind`] variant, mirroring
+/// Phase 07's per-variant table test for the tokenizer-level kinds.
+///
+/// Each case asserts the expected kind is *present*, not that it's the
+/// only one — several of these inputs legitimately raise more than one
+/// error (an unclosed `<div>`, for instance, is both a stray-end-tag
+/// trigger and an unclosed-element-at-EOF trigger), and pinning the
+/// exact multiset would make the tests brittle without testing anything
+/// more.
+#[cfg(test)]
+mod tree_construction_error_tests {
+    use super::parse;
+    use crate::tokenizer::ParseErrorKind;
+
+    fn kinds(input: &str) -> Vec<ParseErrorKind> {
+        parse(input)
+            .errors
+            .into_iter()
+            .map(|error| error.kind)
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_raises(input: &str, expected: ParseErrorKind) {
+        let raised = kinds(input);
+        assert!(
+            raised.contains(&expected),
+            "expected {expected:?} for {input:?}, got {raised:?}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_does_not_raise(input: &str, unexpected: ParseErrorKind) {
+        let raised = kinds(input);
+        assert!(
+            !raised.contains(&unexpected),
+            "expected no {unexpected:?} for {input:?}, got {raised:?}"
+        );
+    }
+
+    /// §13.2.6.4.7's "close a p element": the `<div>` closes the open
+    /// `<p>`, but `<span>` (not in the implied-end-tag set) is still
+    /// open when it does.
+    #[test]
+    fn implied_p_end_tag_with_unclosed_elements() {
+        assert_raises(
+            "<!doctype html><p><span><div>",
+            ParseErrorKind::ImpliedEndTagWithUnclosedElements,
+        );
+        // ...but a `<p>` that is itself the current node closes cleanly.
+        assert_does_not_raise(
+            "<!doctype html><p>text<div>",
+            ParseErrorKind::ImpliedEndTagWithUnclosedElements,
+        );
+    }
+
+    /// Note the explicit `<body>`: a bare `</p>` straight after the
+    /// DOCTYPE is still in "before head", whose *own* "any other end
+    /// tag" rule (a separate, deliberately unimplemented condition —
+    /// see `plan/08-tree-construction-errors.md`) swallows it before
+    /// "in body" ever sees it.
+    #[test]
+    fn p_end_tag_without_p_in_button_scope() {
+        assert_raises(
+            "<!doctype html><body></p>",
+            ParseErrorKind::EndTagPWithoutPInButtonScope,
+        );
+        assert_does_not_raise(
+            "<!doctype html><p>text</p>",
+            ParseErrorKind::EndTagPWithoutPInButtonScope,
+        );
+    }
+
+    /// §13.2.6.4.7's "any other end tag", step 3: `body` is in the
+    /// special category, so the walk up the stack stops there.
+    #[test]
+    fn stray_end_tag_with_no_matching_open_element() {
+        assert_raises("<!doctype html><body></span>", ParseErrorKind::StrayEndTag);
+        assert_does_not_raise("<!doctype html><span>x</span>", ParseErrorKind::StrayEndTag);
+    }
+
+    #[test]
+    fn end_tag_br() {
+        assert_raises("<!doctype html></br>", ParseErrorKind::EndTagBr);
+    }
+
+    /// §13.2.5: a self-closing start tag whose handling rule never
+    /// acknowledges the flag. `<div>` is not a void element; `<br>` is.
+    #[test]
+    fn self_closing_syntax_on_a_non_void_element() {
+        assert_raises(
+            "<!doctype html><div/></div>",
+            ParseErrorKind::NonVoidHtmlElementStartTagWithTrailingSolidus,
+        );
+        assert_does_not_raise(
+            "<!doctype html><br/>",
+            ParseErrorKind::NonVoidHtmlElementStartTagWithTrailingSolidus,
+        );
+        // Foreign content acknowledges it too (§13.2.6.5).
+        assert_does_not_raise(
+            "<!doctype html><svg><rect/></svg>",
+            ParseErrorKind::NonVoidHtmlElementStartTagWithTrailingSolidus,
+        );
+    }
+
+    /// §13.2.6.4.7's end-of-file rule: `div` is not in the "may still be
+    /// open" list, `p` is.
+    #[test]
+    fn eof_with_unclosed_elements() {
+        assert_raises(
+            "<!doctype html><div>",
+            ParseErrorKind::EofWithUnclosedElements,
+        );
+        assert_does_not_raise(
+            "<!doctype html><p>text",
+            ParseErrorKind::EofWithUnclosedElements,
+        );
+    }
+
+    /// §13.2.6.4.8: EOF while still inside a RAWTEXT/RCDATA/script
+    /// element's text.
+    #[test]
+    fn eof_in_text_mode() {
+        assert_raises(
+            "<!doctype html><script>var x = 1;",
+            ParseErrorKind::EofInTextMode,
+        );
+        assert_does_not_raise(
+            "<!doctype html><script>var x = 1;</script>",
+            ParseErrorKind::EofInTextMode,
+        );
+    }
+
+    #[test]
+    fn start_tag_image() {
+        assert_raises(
+            "<!doctype html><image src=x>",
+            ParseErrorKind::StartTagImage,
+        );
+        assert_does_not_raise("<!doctype html><img src=x>", ParseErrorKind::StartTagImage);
+    }
+
+    #[test]
+    fn nested_form() {
+        assert_raises("<!doctype html><form><form>", ParseErrorKind::NestedForm);
+        assert_does_not_raise(
+            "<!doctype html><form></form><form>",
+            ParseErrorKind::NestedForm,
+        );
+    }
+
+    #[test]
+    fn start_tag_table_while_a_table_is_open() {
+        assert_raises(
+            "<!doctype html><table><table></table></table>",
+            ParseErrorKind::StartTagTableInTable,
+        );
+        assert_does_not_raise(
+            "<!doctype html><table></table><table></table>",
+            ParseErrorKind::StartTagTableInTable,
+        );
+    }
+
+    /// §13.2.6.4.9's "anything else" — the foster-parenting fallback.
+    #[test]
+    fn misplaced_token_in_table() {
+        assert_raises(
+            "<!doctype html><table><select></select></table>",
+            ParseErrorKind::MisplacedTokenInTable,
+        );
+        assert_raises(
+            "<!doctype html><table><input></table>",
+            ParseErrorKind::MisplacedTokenInTable,
+        );
+        assert_does_not_raise(
+            "<!doctype html><table><tr><td>x</td></tr></table>",
+            ParseErrorKind::MisplacedTokenInTable,
+        );
+    }
+
+    /// §13.2.6.4.10: reported once per non-whitespace character run, not
+    /// once per character.
+    #[test]
+    fn non_space_characters_in_table() {
+        let raised = kinds("<!doctype html><table>text</table>");
+        assert_eq!(
+            raised
+                .iter()
+                .filter(|kind| **kind == ParseErrorKind::NonSpaceCharactersInTable)
+                .count(),
+            1,
+            "got {raised:?}"
+        );
+        assert_does_not_raise(
+            "<!doctype html><table>   </table>",
+            ParseErrorKind::NonSpaceCharactersInTable,
+        );
+    }
+
+    #[test]
+    fn stray_end_tag_in_table() {
+        assert_raises(
+            "<!doctype html><table></tr></table>",
+            ParseErrorKind::StrayEndTagInTable,
+        );
+    }
+
+    /// §13.2.6.4.17's "anything else" — any non-whitespace content once
+    /// `</body>` has been seen.
+    #[test]
+    fn token_after_body() {
+        assert_raises(
+            "<!doctype html><body></body>text",
+            ParseErrorKind::TokenAfterBody,
+        );
+        assert_raises(
+            "<!doctype html><body></body><p>x</p>",
+            ParseErrorKind::TokenAfterBody,
+        );
+        assert_does_not_raise(
+            "<!doctype html><body></body>\n",
+            ParseErrorKind::TokenAfterBody,
+        );
+    }
+
+    /// A second DOCTYPE, anywhere after the "initial" insertion mode has
+    /// already consumed the first one.
+    #[test]
+    fn stray_doctype() {
+        assert_raises(
+            "<!doctype html><title>t</title><!doctype html>",
+            ParseErrorKind::StrayDoctype,
+        );
+        assert_raises(
+            "<!doctype html><body>x<!doctype html>",
+            ParseErrorKind::StrayDoctype,
+        );
+        assert_does_not_raise(
+            "<!doctype html><title>t</title>",
+            ParseErrorKind::StrayDoctype,
+        );
+    }
+
+    /// The merged error list stays in document order even though the two
+    /// stages produce entries independently (`parse`'s own sort).
+    #[test]
+    fn errors_from_both_stages_are_merged_in_document_order() {
+        let errors = parse("<!doctype html><p>&notAnEntity;<span><div></p>").errors;
+        assert!(
+            errors.len() >= 2,
+            "expected both a tokenizer and a tree-construction error, got {errors:?}"
+        );
+        assert!(
+            errors
+                .windows(2)
+                .all(|pair| pair[0].position.byte_offset <= pair[1].position.byte_offset),
+            "not in document order: {errors:?}"
         );
     }
 }
