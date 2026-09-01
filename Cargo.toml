@@ -2,7 +2,7 @@
 name = "html5-parser"
 version = "0.3.0"
 edition = "2024"
-description = "A pure-Rust WHATWG HTML5 tokenizer and tree-construction implementation"
+description = "A Rust WHATWG HTML5 tokenizer and tree-construction implementation"
 license = "MIT"
 repository = "https://github.com/casoon/html5-parser"
 readme = "README.md"

@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/html5-parser.svg)](https://crates.io/crates/html5-parser)
 [![docs.rs](https://img.shields.io/docsrs/html5-parser)](https://docs.rs/html5-parser)
 
-A pure-Rust [WHATWG HTML5](https://html.spec.whatwg.org/multipage/parsing.html)
+A Rust [WHATWG HTML5](https://html.spec.whatwg.org/multipage/parsing.html)
 parser: tokenizer + full tree construction, transcribed directly from the
 spec rather than ported from another implementation.
 
