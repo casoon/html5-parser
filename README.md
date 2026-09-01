@@ -19,6 +19,10 @@ spec rather than ported from another implementation.
   its line/column/byte offset in the original input, not just the parsed
   structure — useful for anything that needs to point back at source
   (linters, validators, diagnostics).
+- **Parse errors, not just a tree.** `parse()` also reports every WHATWG
+  "parse error" (§13.2.2) encountered, tokenizer- and tree-construction-
+  level alike, each with its own source position — useful for diagnostics
+  tooling, not just silent best-effort recovery.
 - **No dependencies, no `unsafe`.**
 
 ## Usage
@@ -27,8 +31,11 @@ spec rather than ported from another implementation.
 use html5_parser::{parse, Document, NodeId, NodeKind};
 
 fn main() {
-    let document = parse("<!DOCTYPE html><title>Hi</title><h1>Hello, world!</h1>");
-    print_tree(&document, document.root(), 0);
+    let result = parse("<!DOCTYPE html><title>Hi</title><h1>Hello, world!</h1>");
+    print_tree(&result.document, result.document.root(), 0);
+    for error in &result.errors {
+        println!("{:?} at {:?}", error.kind, error.position);
+    }
 }
 
 fn print_tree(document: &Document, node: NodeId, depth: usize) {
