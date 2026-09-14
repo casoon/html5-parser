@@ -2061,8 +2061,12 @@ impl TreeBuilder {
                 return;
             };
 
-            // Step 4.4
+            // Step 4.4: "If formattingElement is not in the stack of open
+            // elements, then this is a parse error; remove the element
+            // from the list, and return." — the element was already
+            // closed implicitly, so this end tag has nothing left to close.
             if !self.open_elements.contains(formatting_element) {
+                self.error(ParseErrorKind::StrayEndTag, position);
                 let index = self
                     .active_formatting_elements
                     .entries
@@ -2087,11 +2091,16 @@ impl TreeBuilder {
                 .open_elements
                 .has_element_in_scope(&self.document, formatting_element_name)
             {
+                // "...then this is a parse error; return."
+                self.error(ParseErrorKind::FormattingElementNotInScope, position);
                 return;
             }
 
-            // Step 4.6 is a parse-error-only observation; no tree-shape
-            // effect, nothing to do.
+            // Step 4.6: "If formattingElement is not the current node,
+            // this is a parse error." No tree-shape effect.
+            if self.open_elements.current_node() != Some(formatting_element) {
+                self.error(ParseErrorKind::MisnestedFormattingElement, position);
+            }
 
             // Step 4.7
             let furthest_block = self
@@ -2439,7 +2448,10 @@ impl TreeBuilder {
     /// html start tag can only ever hit this one "in body" rule, so
     /// it's implemented standalone here rather than waiting for the
     /// rest of "in body" to exist.
-    fn merge_attributes_onto_html_element(&mut self, tag: &TagToken) {
+    fn merge_attributes_onto_html_element(&mut self, tag: &TagToken, position: Position) {
+        // "Parse error." — unconditional, ahead of the template check
+        // that only decides whether the attributes are merged.
+        self.error(ParseErrorKind::StrayStartTag, position);
         if self.has_template_on_stack() {
             return;
         }
@@ -2682,7 +2694,11 @@ impl TreeBuilder {
                 );
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::Doctype(_) => TokenOutcome::Consumed(None),
+            TokenKind::Doctype(_) => {
+                // "A DOCTYPE token: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayDoctype, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
@@ -2912,7 +2928,11 @@ impl TreeBuilder {
             {
                 self.before_html_anything_else()
             }
-            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::EndTag(_) => {
+                // "Any other end tag: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTag, position);
+                TokenOutcome::Consumed(None)
+            }
             _ => self.before_html_anything_else(),
         }
     }
@@ -2959,7 +2979,7 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "html" => {
-                self.merge_attributes_onto_html_element(tag);
+                self.merge_attributes_onto_html_element(tag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "head" => {
@@ -2973,7 +2993,11 @@ impl TreeBuilder {
             {
                 self.before_head_anything_else()
             }
-            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::EndTag(_) => {
+                // "Any other end tag: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTag, position);
+                TokenOutcome::Consumed(None)
+            }
             _ => self.before_head_anything_else(),
         }
     }
@@ -3576,7 +3600,7 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "html" => {
-                self.merge_attributes_onto_html_element(tag);
+                self.merge_attributes_onto_html_element(tag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag)
@@ -3643,6 +3667,7 @@ impl TreeBuilder {
             TokenKind::EndTag(tag) if tag.name == "template" => {
                 if !self.has_template_on_stack() {
                     // Parse error, ignore the token.
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -3659,8 +3684,17 @@ impl TreeBuilder {
                 self.reset_the_insertion_mode_appropriately();
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::StartTag(tag) if tag.name == "head" => TokenOutcome::Consumed(None),
-            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::StartTag(tag) if tag.name == "head" => {
+                // "A start tag whose tag name is 'head': Parse error.
+                // Ignore the token."
+                self.error(ParseErrorKind::StrayStartTag, position);
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::EndTag(_) => {
+                // "Any other end tag: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTag, position);
+                TokenOutcome::Consumed(None)
+            }
             _ => self.in_head_anything_else(),
         }
     }
@@ -3691,7 +3725,7 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "html" => {
-                self.merge_attributes_onto_html_element(tag);
+                self.merge_attributes_onto_html_element(tag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag) if tag.name == "noscript" => {
@@ -3715,9 +3749,15 @@ impl TreeBuilder {
             }
             TokenKind::EndTag(tag) if tag.name == "br" => self.in_head_noscript_anything_else(),
             TokenKind::StartTag(tag) if matches!(tag.name.as_str(), "head" | "noscript") => {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayStartTag, position);
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::EndTag(_) => {
+                // "Any other end tag: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTag, position);
+                TokenOutcome::Consumed(None)
+            }
             _ => self.in_head_noscript_anything_else(),
         }
     }
@@ -3760,7 +3800,7 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "html" => {
-                self.merge_attributes_onto_html_element(tag);
+                self.merge_attributes_onto_html_element(tag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "body" => {
@@ -3812,8 +3852,17 @@ impl TreeBuilder {
             TokenKind::EndTag(tag) if matches!(tag.name.as_str(), "body" | "html" | "br") => {
                 self.after_head_anything_else()
             }
-            TokenKind::StartTag(tag) if tag.name == "head" => TokenOutcome::Consumed(None),
-            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::StartTag(tag) if tag.name == "head" => {
+                // "A start tag whose tag name is 'head': Parse error.
+                // Ignore the token."
+                self.error(ParseErrorKind::StrayStartTag, position);
+                TokenOutcome::Consumed(None)
+            }
+            TokenKind::EndTag(_) => {
+                // "Any other end tag: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTag, position);
+                TokenOutcome::Consumed(None)
+            }
             _ => self.after_head_anything_else(),
         }
     }
@@ -3895,7 +3944,7 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "html" => {
-                self.merge_attributes_onto_html_element(tag);
+                self.merge_attributes_onto_html_element(tag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag)
@@ -3919,6 +3968,9 @@ impl TreeBuilder {
                 self.process_token_in_head(kind, position)
             }
             TokenKind::StartTag(tag) if tag.name == "body" => {
+                // "Parse error." — unconditional, ahead of the checks
+                // that decide whether the token is ignored or merged.
+                self.error(ParseErrorKind::StrayStartTag, position);
                 let second = self.open_elements.entries.get(1).copied();
                 let ignore = self.open_elements.entries.len() == 1
                     || second.is_none_or(|node| !self.node_has_html_name(node, "body"))
@@ -3930,7 +3982,8 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "frameset" => {
-                // Parse-error-only observation has no tree-shape effect.
+                // "Parse error." — unconditional, like `<body>` above.
+                self.error(ParseErrorKind::StrayStartTag, position);
                 // Note the ignore condition here is genuinely only two
                 // clauses (unlike the `<body>` start-tag rule just
                 // above, which has a third, explicit "or if there is a
@@ -3972,6 +4025,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, "body")
                 {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 if self.has_unexpected_open_elements() {
@@ -3985,6 +4040,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, "body")
                 {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 if self.has_unexpected_open_elements() {
@@ -4208,6 +4265,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, &tag.name)
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -4221,16 +4280,23 @@ impl TreeBuilder {
                         .open_elements
                         .has_element_in_scope(&self.document, "form")
                     {
+                        // "...this is a parse error; ignore the token."
+                        self.error(ParseErrorKind::StrayEndTag, position);
                         return TokenOutcome::Consumed(None);
                     }
                     self.open_elements
                         .generate_implied_end_tags(&self.document, None);
                     self.pop_until_one_of_popped(&["form"]);
                 } else {
+                    // "If node is null or [...] the stack of open elements
+                    // does not have node in scope, then this is a parse
+                    // error; return and ignore the token."
                     let Some(node) = self.form_element_pointer.take() else {
+                        self.error(ParseErrorKind::StrayEndTag, position);
                         return TokenOutcome::Consumed(None);
                     };
                     if !self.has_node_in_scope(node) {
+                        self.error(ParseErrorKind::StrayEndTag, position);
                         return TokenOutcome::Consumed(None);
                     }
                     self.open_elements
@@ -4265,6 +4331,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_list_item_scope(&self.document, "li")
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -4277,6 +4345,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, &tag.name)
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -4292,6 +4362,8 @@ impl TreeBuilder {
                     self.open_elements
                         .has_element_in_scope(&self.document, heading)
                 }) {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -4316,6 +4388,9 @@ impl TreeBuilder {
                         _ => None,
                     });
                 if let Some(existing_a) = existing_a {
+                    // "...then this is a parse error; run the adoption
+                    // agency algorithm for the token, ..."
+                    self.error(ParseErrorKind::NestedFormattingElement, position);
                     self.adoption_agency_algorithm(tag, position);
                     self.remove_node_from_active_formatting_elements(existing_a);
                     self.remove_node_from_open_elements(existing_a);
@@ -4354,6 +4429,9 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, "nobr")
                 {
+                    // "...then this is a parse error; run the adoption
+                    // agency algorithm for the token, ..."
+                    self.error(ParseErrorKind::NestedFormattingElement, position);
                     self.adoption_agency_algorithm(tag, position);
                     self.reconstruct_the_active_formatting_elements();
                 }
@@ -4399,6 +4477,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, &tag.name)
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTag, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -4555,6 +4635,10 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_scope(&self.document, "select")
                 {
+                    // "...then this is a parse error; pop elements [...]
+                    // until a select element has been popped" — the
+                    // token itself is never inserted.
+                    self.error(ParseErrorKind::StrayStartTag, position);
                     self.pop_until_one_of_popped(&["select"]);
                 } else {
                     self.reconstruct_the_active_formatting_elements();
@@ -4659,7 +4743,9 @@ impl TreeBuilder {
                         | "tr"
                 ) =>
             {
+                // "Parse error. Ignore the token."
                 let _ = tag;
+                self.error(ParseErrorKind::StrayStartTag, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) => {
@@ -4845,6 +4931,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_table_scope(&self.document, "table")
                 {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.pop_until_one_of_popped(&["table"]);
@@ -4899,6 +4987,9 @@ impl TreeBuilder {
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag) if tag.name == "form" => {
+                // "Parse error." — unconditional, ahead of the check that
+                // only decides whether the token is ignored.
+                self.error(ParseErrorKind::MisplacedTokenInTable, position);
                 if self.has_template_on_stack() || self.form_element_pointer.is_some() {
                     return TokenOutcome::Consumed(None);
                 }
@@ -4992,7 +5083,10 @@ impl TreeBuilder {
     fn process_token_in_caption(&mut self, kind: &TokenKind, position: Position) -> TokenOutcome {
         match kind {
             TokenKind::EndTag(tag) if tag.name == "caption" => {
-                self.close_caption();
+                if !self.close_caption() {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
+                }
                 TokenOutcome::Consumed(None)
             }
             TokenKind::StartTag(tag)
@@ -5012,6 +5106,8 @@ impl TreeBuilder {
                 if self.close_caption() {
                     TokenOutcome::Reprocess
                 } else {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::MisplacedTokenInTable, position);
                     TokenOutcome::Consumed(None)
                 }
             }
@@ -5019,6 +5115,8 @@ impl TreeBuilder {
                 if self.close_caption() {
                     TokenOutcome::Reprocess
                 } else {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     TokenOutcome::Consumed(None)
                 }
             }
@@ -5037,6 +5135,8 @@ impl TreeBuilder {
                         | "tr"
                 ) =>
             {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTagInTable, position);
                 TokenOutcome::Consumed(None)
             }
             _ => self.process_token_in_body(kind, position),
@@ -5086,13 +5186,19 @@ impl TreeBuilder {
                     .current_node()
                     .is_some_and(|node| self.node_has_html_name(node, "colgroup"))
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements.pop();
                 self.insertion_mode = InsertionMode::InTable;
                 TokenOutcome::Consumed(None)
             }
-            TokenKind::EndTag(tag) if tag.name == "col" => TokenOutcome::Consumed(None),
+            TokenKind::EndTag(tag) if tag.name == "col" => {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTagInTable, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::StartTag(tag) if tag.name == "template" => {
                 self.process_token_in_head(kind, position)
             }
@@ -5106,6 +5212,13 @@ impl TreeBuilder {
                     .current_node()
                     .is_some_and(|node| self.node_has_html_name(node, "colgroup"))
                 {
+                    // "...then this is a parse error; ignore the token."
+                    let error_kind = if matches!(kind, TokenKind::EndTag(_)) {
+                        ParseErrorKind::StrayEndTagInTable
+                    } else {
+                        ParseErrorKind::MisplacedTokenInTable
+                    };
+                    self.error(error_kind, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements.pop();
@@ -5120,18 +5233,18 @@ impl TreeBuilder {
     /// `</thead>`/`</tfoot>` rule and its "close it implicitly and
     /// reprocess" group. Returns whether it actually closed one (false
     /// only when none of tbody/thead/tfoot is in table scope).
-    fn close_table_body_and_reprocess(&mut self) -> TokenOutcome {
+    fn close_table_body(&mut self) -> bool {
         let in_scope = ["tbody", "thead", "tfoot"].iter().any(|&name| {
             self.open_elements
                 .has_element_in_table_scope(&self.document, name)
         });
         if !in_scope {
-            return TokenOutcome::Consumed(None);
+            return false;
         }
         self.clear_stack_back_to_a_table_body_context();
         self.open_elements.pop();
         self.insertion_mode = InsertionMode::InTable;
-        TokenOutcome::Reprocess
+        true
     }
 
     /// The "in table body" insertion mode (§13.2.6.4.13).
@@ -5163,6 +5276,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_table_scope(&self.document, &tag.name)
                 {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.clear_stack_back_to_a_table_body_context();
@@ -5176,15 +5291,31 @@ impl TreeBuilder {
                     "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead"
                 ) =>
             {
-                self.close_table_body_and_reprocess()
+                if self.close_table_body() {
+                    TokenOutcome::Reprocess
+                } else {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::MisplacedTokenInTable, position);
+                    TokenOutcome::Consumed(None)
+                }
             }
-            TokenKind::EndTag(tag) if tag.name == "table" => self.close_table_body_and_reprocess(),
+            TokenKind::EndTag(tag) if tag.name == "table" => {
+                if self.close_table_body() {
+                    TokenOutcome::Reprocess
+                } else {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
+                    TokenOutcome::Consumed(None)
+                }
+            }
             TokenKind::EndTag(tag)
                 if matches!(
                     tag.name.as_str(),
                     "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" | "tr"
                 ) =>
             {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTagInTable, position);
                 TokenOutcome::Consumed(None)
             }
             _ => self.process_token_in_table(kind, position),
@@ -5195,17 +5326,17 @@ impl TreeBuilder {
     /// shared by "in row"'s (§13.2.6.4.14) `</tr>` rule and its "close
     /// it implicitly and reprocess" group. Returns whether it actually
     /// closed one (false only when `tr` isn't in table scope).
-    fn close_row_and_reprocess(&mut self) -> TokenOutcome {
+    fn close_row(&mut self) -> bool {
         if !self
             .open_elements
             .has_element_in_table_scope(&self.document, "tr")
         {
-            return TokenOutcome::Consumed(None);
+            return false;
         }
         self.clear_stack_back_to_a_table_row_context();
         self.open_elements.pop();
         self.insertion_mode = InsertionMode::InTableBody;
-        TokenOutcome::Reprocess
+        true
     }
 
     /// The "in row" insertion mode (§13.2.6.4.14).
@@ -5223,6 +5354,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_table_scope(&self.document, "tr")
                 {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.clear_stack_back_to_a_table_row_context();
@@ -5236,17 +5369,40 @@ impl TreeBuilder {
                     "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" | "tr"
                 ) =>
             {
-                self.close_row_and_reprocess()
+                if self.close_row() {
+                    TokenOutcome::Reprocess
+                } else {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::MisplacedTokenInTable, position);
+                    TokenOutcome::Consumed(None)
+                }
             }
-            TokenKind::EndTag(tag) if tag.name == "table" => self.close_row_and_reprocess(),
+            TokenKind::EndTag(tag) if tag.name == "table" => {
+                if self.close_row() {
+                    TokenOutcome::Reprocess
+                } else {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
+                    TokenOutcome::Consumed(None)
+                }
+            }
             TokenKind::EndTag(tag) if matches!(tag.name.as_str(), "tbody" | "tfoot" | "thead") => {
                 if !self
                     .open_elements
                     .has_element_in_table_scope(&self.document, &tag.name)
                 {
+                    // "...this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
-                self.close_row_and_reprocess()
+                // "If the stack of open elements does not have a tr
+                // element in table scope, ignore the token." — no parse
+                // error on this second check.
+                if self.close_row() {
+                    TokenOutcome::Reprocess
+                } else {
+                    TokenOutcome::Consumed(None)
+                }
             }
             TokenKind::EndTag(tag)
                 if matches!(
@@ -5254,6 +5410,8 @@ impl TreeBuilder {
                     "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th"
                 ) =>
             {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTagInTable, position);
                 TokenOutcome::Consumed(None)
             }
             _ => self.process_token_in_table(kind, position),
@@ -5277,6 +5435,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_table_scope(&self.document, &tag.name)
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.open_elements
@@ -5309,6 +5469,8 @@ impl TreeBuilder {
                     "body" | "caption" | "col" | "colgroup" | "html"
                 ) =>
             {
+                // "Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTagInTable, position);
                 TokenOutcome::Consumed(None)
             }
             TokenKind::EndTag(tag)
@@ -5321,6 +5483,8 @@ impl TreeBuilder {
                     .open_elements
                     .has_element_in_table_scope(&self.document, &tag.name)
                 {
+                    // "...then this is a parse error; ignore the token."
+                    self.error(ParseErrorKind::StrayEndTagInTable, position);
                     return TokenOutcome::Consumed(None);
                 }
                 self.close_the_cell();
@@ -5386,7 +5550,11 @@ impl TreeBuilder {
                 self.switch_from_in_template_to(InsertionMode::InRow)
             }
             TokenKind::StartTag(_) => self.switch_from_in_template_to(InsertionMode::InBody),
-            TokenKind::EndTag(_) => TokenOutcome::Consumed(None),
+            TokenKind::EndTag(_) => {
+                // "Any other end tag: Parse error. Ignore the token."
+                self.error(ParseErrorKind::StrayEndTag, position);
+                TokenOutcome::Consumed(None)
+            }
             TokenKind::Eof => {
                 // "If there is no template element on the stack of open
                 // elements, stop parsing" is the fragment case (never
