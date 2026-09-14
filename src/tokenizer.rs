@@ -138,6 +138,10 @@ pub enum ParseErrorKind {
     StrayEndTagInTable,
     TokenAfterBody,
     StrayDoctype,
+    StrayStartTag,
+    NestedFormattingElement,
+    FormattingElementNotInScope,
+    MisnestedFormattingElement,
 }
 
 impl std::fmt::Display for ParseErrorKind {
@@ -263,6 +267,16 @@ impl std::fmt::Display for ParseErrorKind {
             Self::StrayEndTagInTable => "a stray end tag inside a table",
             Self::TokenAfterBody => "a token after the \"body\" element had been closed",
             Self::StrayDoctype => "a stray DOCTYPE",
+            Self::StrayStartTag => "a stray start tag that is not allowed here",
+            Self::NestedFormattingElement => {
+                "an \"a\" or \"nobr\" start tag while the previous one is still open"
+            }
+            Self::FormattingElementNotInScope => {
+                "an end tag for a formatting element that is open but not in scope"
+            }
+            Self::MisnestedFormattingElement => {
+                "a formatting element end tag that violates nesting rules (misnested tags)"
+            }
         };
         f.write_str(text)
     }

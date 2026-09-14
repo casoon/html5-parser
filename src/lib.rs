@@ -788,10 +788,9 @@ mod tree_construction_error_tests {
     }
 
     /// Note the explicit `<body>`: a bare `</p>` straight after the
-    /// DOCTYPE is still in "before head", whose *own* "any other end
-    /// tag" rule (a separate, deliberately unimplemented condition —
-    /// see `plan/08-tree-construction-errors.md`) swallows it before
-    /// "in body" ever sees it.
+    /// DOCTYPE is still in "before html", whose *own* "any other end
+    /// tag" rule ignores it (reported as `StrayEndTag`, see
+    /// `stray_end_tags_before_body` below) before "in body" ever sees it.
     #[test]
     fn p_end_tag_without_p_in_button_scope() {
         assert_raises(
@@ -970,6 +969,175 @@ mod tree_construction_error_tests {
         );
         assert_does_not_raise(
             "<!doctype html><title>t</title>",
+            ParseErrorKind::StrayDoctype,
+        );
+    }
+
+    /// A well-formed document raises no tree-construction error at all —
+    /// guards the new ignore-the-token reports against firing on valid
+    /// markup (explicit `html`/`head`/`body` tags, a full table, nested
+    /// formatting elements closed in order).
+    #[test]
+    fn valid_document_raises_no_errors() {
+        let raised = kinds(
+            "<!doctype html><html lang=en><head><title>t</title></head><body>\
+             <h1>x</h1><ul><li>a</li></ul><dl><dt>t</dt><dd>d</dd></dl>\
+             <form><p><b><i>x</i></b> <a href=/>y</a></p></form>\
+             <table><caption>c</caption><colgroup><col></colgroup>\
+             <thead><tr><th>h</th></tr></thead><tbody><tr><td>x</td></tr></tbody></table>\
+             <template><div></div></template><select><option>o</option></select>\
+             </body></html>\n",
+        );
+        assert!(raised.is_empty(), "got {raised:?}");
+    }
+
+    /// §13.2.6.4.7: every "in body" end-tag rule that ignores the token
+    /// when no matching element is in scope ("this is a parse error;
+    /// ignore the token").
+    #[test]
+    fn stray_end_tags_with_no_element_in_scope() {
+        for input in [
+            "<!doctype html><p>x</p></div>",
+            "<!doctype html><p>x</p></header>",
+            "<!doctype html><p>x</p></li>",
+            "<!doctype html><p>x</p></dd>",
+            "<!doctype html><p>x</p></h2>",
+            "<!doctype html><p>x</p></form>",
+            "<!doctype html><p>x</p></object>",
+            // `object` is a scope boundary, so `body` is not in scope.
+            "<!doctype html><object></body></object>",
+            "<!doctype html><object></html></object>",
+        ] {
+            assert_raises(input, ParseErrorKind::StrayEndTag);
+        }
+        // Any open heading satisfies a heading end tag, whatever its rank.
+        assert_does_not_raise("<!doctype html><h1>x</h2>", ParseErrorKind::StrayEndTag);
+        assert_does_not_raise(
+            "<!doctype html><ul><li>x</li></ul>",
+            ParseErrorKind::StrayEndTag,
+        );
+    }
+
+    /// "Any other end tag: Parse error. Ignore the token." in "before
+    /// html" (§13.2.6.4.2), "before head" (.3), "in head" (.4), "after
+    /// head" (.6) and "in template" (.16), plus "in head"'s `</template>`
+    /// with no template open.
+    #[test]
+    fn stray_end_tags_before_body() {
+        for input in [
+            "<!doctype html></p>",
+            "<!doctype html><html></div>",
+            "<!doctype html><head></div></head>",
+            "<!doctype html><head></template></head>",
+            "<!doctype html><head></head></div>",
+            "<!doctype html><template></div></template>",
+        ] {
+            assert_raises(input, ParseErrorKind::StrayEndTag);
+        }
+        assert_does_not_raise(
+            "<!doctype html><html><head></head><body></body></html>",
+            ParseErrorKind::StrayEndTag,
+        );
+    }
+
+    /// Start tags the spec ignores (or merges into an existing element)
+    /// with a parse error: `html`/`body`/`frameset` in body, a second
+    /// `head`, table-structure tags outside a table, a nested `select`.
+    #[test]
+    fn stray_start_tag() {
+        for input in [
+            "<!doctype html><body><html lang=en>",
+            "<!doctype html><head><html>",
+            "<!doctype html><body><body>",
+            "<!doctype html><body><frameset>",
+            "<!doctype html><head><head>",
+            "<!doctype html><head></head><head>",
+            "<!doctype html><body><td>x",
+            "<!doctype html><body><tr>",
+            "<!doctype html><select><select>",
+        ] {
+            assert_raises(input, ParseErrorKind::StrayStartTag);
+        }
+        assert_does_not_raise(
+            "<!doctype html><html><head></head><body><table><tr><td>x</td></tr></table>",
+            ParseErrorKind::StrayStartTag,
+        );
+    }
+
+    /// §13.2.6.4.7: an `a` start tag while an `a` is still in the list of
+    /// active formatting elements, or `nobr` while one is in scope.
+    #[test]
+    fn nested_formatting_element() {
+        assert_raises(
+            "<!doctype html><a href=x><a href=y>",
+            ParseErrorKind::NestedFormattingElement,
+        );
+        assert_raises(
+            "<!doctype html><nobr><nobr>",
+            ParseErrorKind::NestedFormattingElement,
+        );
+        assert_does_not_raise(
+            "<!doctype html><a href=x>x</a><a href=y>y</a>",
+            ParseErrorKind::NestedFormattingElement,
+        );
+    }
+
+    /// Adoption agency algorithm step 4.6: the formatting element being
+    /// closed is not the current node. Step 4.4 then reports the
+    /// already-closed `</i>` as a stray end tag.
+    #[test]
+    fn misnested_formatting_element() {
+        let input = "<!doctype html><p><b><i>x</b></i></p>";
+        assert_raises(input, ParseErrorKind::MisnestedFormattingElement);
+        assert_raises(input, ParseErrorKind::StrayEndTag);
+        assert_does_not_raise(
+            "<!doctype html><p><b><i>x</i></b></p>",
+            ParseErrorKind::MisnestedFormattingElement,
+        );
+    }
+
+    /// Adoption agency algorithm step 4.5: the `b` is open, but the
+    /// `table` between it and the current node is a scope boundary.
+    #[test]
+    fn formatting_element_not_in_scope() {
+        assert_raises(
+            "<!doctype html><b><table></b></table>",
+            ParseErrorKind::FormattingElementNotInScope,
+        );
+        assert_does_not_raise(
+            "<!doctype html><b>x</b>",
+            ParseErrorKind::FormattingElementNotInScope,
+        );
+    }
+
+    /// The table insertion modes' ignore-the-token end-tag rules
+    /// (§13.2.6.4.9, .11–.15).
+    #[test]
+    fn stray_end_tags_in_table_modes() {
+        for input in [
+            "<!doctype html><table><caption></td></caption></table>",
+            "<!doctype html><table><colgroup></col></colgroup></table>",
+            "<!doctype html><table><tbody></tr></tbody></table>",
+            "<!doctype html><table><tbody></thead></tbody></table>",
+            "<!doctype html><table><tr></td></tr></table>",
+            "<!doctype html><table><tr><td></caption></td></tr></table>",
+            "<!doctype html><table><tr><td></thead></td></tr></table>",
+        ] {
+            assert_raises(input, ParseErrorKind::StrayEndTagInTable);
+        }
+        // "In table"'s `form` start tag is a parse error either way.
+        assert_raises(
+            "<!doctype html><table><form></table>",
+            ParseErrorKind::MisplacedTokenInTable,
+        );
+    }
+
+    /// §13.2.6.5: a DOCTYPE inside foreign content is ignored with a
+    /// parse error, like everywhere else after the "initial" mode.
+    #[test]
+    fn stray_doctype_in_foreign_content() {
+        assert_raises(
+            "<!doctype html><svg><!doctype html></svg>",
             ParseErrorKind::StrayDoctype,
         );
     }
