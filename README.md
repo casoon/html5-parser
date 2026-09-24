@@ -1,5 +1,17 @@
 # html5-parser
 
+> **Dieses Repository ist stillgelegt (24.09.2026).** Das Crate lebt weiter, aber
+> die Quelle ist jetzt das Monorepo
+> **[casoon/barrierlab](https://github.com/casoon/barrierlab)** — dort liegt es
+> unter `crates/html5-parser/`, mit der vollständigen Historie dieses Repositorys, neben
+> `html-conform`, das es benutzt.
+>
+> - **crates.io bleibt unverändert.** Was danach erscheint, kommt aus barrierlab.
+> - **Änderungen und Fehler** gehören dorthin. Hier wird nichts mehr gebaut.
+> - Doku: <https://casoon.github.io/barrierlab/>
+>
+> Der Text unten beschreibt den Stand bei der Stilllegung.
+
 [![crates.io](https://img.shields.io/crates/v/html5-parser.svg)](https://crates.io/crates/html5-parser)
 [![docs.rs](https://img.shields.io/docsrs/html5-parser)](https://docs.rs/html5-parser)
 
